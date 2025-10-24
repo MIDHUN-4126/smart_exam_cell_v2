@@ -1,0 +1,1 @@
+Patch will add asArray helper and normalize responses in DataProvider.fetchData and in POST handler. (Temporary note created by assistant)

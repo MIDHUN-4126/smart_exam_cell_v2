@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Exam Cell</title>
+    <!-- Link to Tailwind CSS via CDN (simpler setup than build process) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      // Basic Tailwind dark mode configuration (optional, based on your App.jsx)
+      tailwind.config = {
+        darkMode: 'class', // Enable dark mode based on class
+        theme: {
+          extend: {
+             fontFamily: {
+               sans: ['Inter', 'sans-serif'], // Example: Use Inter font
+             },
+          }
+        }
+      }
+    </script>
+     <!-- REMOVED: Lucide Icons script (will be imported via npm) -->
+     <!-- <script src="https://unpkg.com/lucide-react@latest/dist/umd/lucide-react.js"></script> -->
+     <link rel="preconnect" href="https://fonts.googleapis.com">
+     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+     <style>
+       /* Basic styles */
+       body { font-family: 'Inter', sans-serif; }
+       /* Add smooth scrolling */
+       html { scroll-behavior: smooth; }
+       /* Simple scrollbar styling (optional) */
+        ::-webkit-scrollbar { width: 8px; height: 8px;}
+        ::-webkit-scrollbar-track { background: #f1f1f1; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb { background: #888; border-radius: 10px;}
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+        .dark ::-webkit-scrollbar-track { background: #2d3748; }
+        .dark ::-webkit-scrollbar-thumb { background: #718096; }
+        .dark ::-webkit-scrollbar-thumb:hover { background: #a0aec0; }
+        #root { min-height: 100vh; display: flex; flex-direction: column; } /* Ensure root takes full height */
+     </style>
+  </head>
+  <body class="antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
