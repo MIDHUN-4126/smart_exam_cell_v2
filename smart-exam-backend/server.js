@@ -19,6 +19,39 @@ app.use(express.json()); // Allow parsing of JSON request bodies
 
 // --- API Routes ---
 
+// Timetable: ensure table exists helper
+async function ensureTimetableTable(conn) {
+    // Check if timetable table exists; if not, create a minimal version
+    const [rows] = await conn.query(
+        `SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'timetable'`
+    );
+    if (rows.length > 0) return true;
+    try {
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS timetable (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                faculty_id INT NOT NULL,
+                course_id INT NOT NULL,
+                day_of_week TINYINT NOT NULL,
+                start_time TIME NOT NULL,
+                end_time TIME NOT NULL,
+                room VARCHAR(64) NULL,
+                section VARCHAR(64) NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_faculty_day (faculty_id, day_of_week, start_time)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+        // Try to add FKs if referenced tables exist; ignore if they fail
+        try { await conn.query(`ALTER TABLE timetable ADD CONSTRAINT fk_tt_faculty FOREIGN KEY (faculty_id) REFERENCES faculty(faculty_id) ON DELETE CASCADE`); } catch (_e) {}
+        try { await conn.query(`ALTER TABLE timetable ADD CONSTRAINT fk_tt_course FOREIGN KEY (course_id) REFERENCES course(course_id) ON DELETE CASCADE`); } catch (_e) {}
+        return true;
+    } catch (e) {
+        console.warn('Could not create timetable table automatically:', e.message);
+        return false;
+    }
+}
+
 // 1. Login Endpoint
 app.post('/api/login', async (req, res) => {
   const { email, password, role } = req.body;
@@ -66,12 +99,12 @@ app.post('/api/login', async (req, res) => {
     let query = '';
     let params = [userAccount.linked_person_id];
 
-    switch (userAccount.person_type) {
+        switch (userAccount.person_type) {
       case 'student':
-        query = 'SELECT student_id as id, first_name, last_name, email FROM student WHERE student_id = ?';
+                query = 'SELECT student_id as id, first_name, last_name, email FROM student WHERE student_id = ?';
         break;
       case 'faculty':
-        query = 'SELECT faculty_id as id, first_name, last_name, email FROM faculty WHERE faculty_id = ?';
+                query = 'SELECT faculty_id as id, first_name, last_name, email FROM faculty WHERE faculty_id = ?';
         break;
       case 'admin':
         // Assuming admins don't have a separate table or linked ID needs different handling
@@ -88,25 +121,60 @@ app.post('/api/login', async (req, res) => {
         return res.status(500).json({ message: 'Invalid user type configuration.' });
     }
     
-    if (query) {
-       const [detailRows] = await pool.query(query, params);
-       if (detailRows.length > 0) {
-            const details = detailRows[0];
-            userDetails = {
-                id: details.id,
-                username: `${details.first_name} ${details.last_name}`,
-                email: details.email,
-            };
-       } else {
-            console.error(`Could not find linked details for ${userAccount.person_type} ID: ${userAccount.linked_person_id}`);
-            // Fallback if linked record not found
-            userDetails = {
-                 id: userAccount.linked_person_id || userAccount.user_id,
-                 username: userAccount.username, // Fallback to username
-                 email: userAccount.username,
+        if (query) {
+            let details = null;
+            let [detailRows] = await pool.query(query, params);
+            if (detailRows.length > 0) {
+                details = detailRows[0];
+            } else {
+                // Fallbacks to handle mismatched key types like 'F001' vs INT faculty_id
+                if (userAccount.person_type === 'faculty') {
+                    // 1) If linked_person_id includes digits, try numeric faculty_id match
+                    const digits = String(userAccount.linked_person_id || '').replace(/\D+/g, '');
+                    if (digits) {
+                        try {
+                            const n = Number(digits);
+                            if (Number.isFinite(n)) {
+                                // try numeric faculty_id
+                                const [rows2] = await pool.query('SELECT faculty_id as id, first_name, last_name, email FROM faculty WHERE faculty_id = ? LIMIT 1', [n]);
+                                if (rows2.length > 0) details = rows2[0];
+                            }
+                        } catch (_) {}
+                    }
+                    // 2) Try matching by email == username as a last resort
+                    if (!details) {
+                        try {
+                            const [rows3] = await pool.query('SELECT faculty_id as id, first_name, last_name, email FROM faculty WHERE email = ? LIMIT 1', [userAccount.username]);
+                            if (rows3.length > 0) details = rows3[0];
+                        } catch (_) {}
+                    }
+                } else if (userAccount.person_type === 'student') {
+                    // Student fallback: try email match
+                    try {
+                        const [rowsS] = await pool.query('SELECT student_id as id, first_name, last_name, email FROM student WHERE email = ? LIMIT 1', [userAccount.username]);
+                        if (rowsS.length > 0) details = rowsS[0];
+                    } catch (_) {}
+                }
+
+                if (!details) {
+                    console.error(`Could not find linked details for ${userAccount.person_type} ID: ${userAccount.linked_person_id}`);
+                    // Fallback if linked record not found
+                    userDetails = {
+                        id: userAccount.linked_person_id || userAccount.user_id,
+                        username: userAccount.username, // Fallback to username
+                        email: userAccount.username,
+                    };
+                }
             }
-       }
-    }
+
+            if (details) {
+                userDetails = {
+                    id: details.id,
+                    username: `${details.first_name} ${details.last_name}`,
+                    email: details.email,
+                };
+            }
+        }
 
 
     // Login successful - return user data (excluding password hash)
@@ -257,6 +325,77 @@ app.get('/api/faculty', async (req, res) => {
     }
 });
 
+// Delete Faculty endpoint (Admin) with FK safety
+// DELETE /api/faculty/:id
+app.delete('/api/faculty/:id', async (req, res) => {
+    const raw = req.params.id;
+    if (!raw) return res.status(400).json({ message: 'Faculty id is required.' });
+    const id = Number(raw);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: 'Faculty id must be a number.' });
+    try {
+        const conn = await pool.getConnection();
+        try {
+            await conn.beginTransaction();
+
+            const doCascade = String(req.query.cascade || '').toLowerCase() === 'true';
+
+            if (doCascade) {
+                // Cascade mode: remove dependent rows first, then delete faculty
+                const [fkRows] = await conn.query(
+                    `SELECT TABLE_NAME, COLUMN_NAME
+                     FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                     WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+                       AND REFERENCED_TABLE_NAME = 'faculty'
+                       AND REFERENCED_COLUMN_NAME = 'faculty_id'`
+                );
+
+                for (const row of fkRows) {
+                    const tbl = row.TABLE_NAME;
+                    const col = row.COLUMN_NAME;
+                    try {
+                        await conn.query(`DELETE FROM \`${tbl}\` WHERE \`${col}\` = ?`, [id]);
+                    } catch (e) {
+                        if (!(e && (e.code === 'ER_NO_SUCH_TABLE' || e.code === 'ER_BAD_FIELD_ERROR'))) {
+                            throw e;
+                        }
+                    }
+                }
+
+                const [result] = await conn.query('DELETE FROM faculty WHERE faculty_id = ? LIMIT 1', [id]);
+                await conn.commit();
+                if ((result.affectedRows || 0) > 0) return res.sendStatus(204);
+                return res.status(404).json({ message: 'Faculty not found' });
+            } else {
+                // Non-cascade: try a simple delete; if FK blocks, report conflict
+                try {
+                    const [result] = await conn.query('DELETE FROM faculty WHERE faculty_id = ? LIMIT 1', [id]);
+                    await conn.commit();
+                    if ((result.affectedRows || 0) > 0) return res.sendStatus(204);
+                    return res.status(404).json({ message: 'Faculty not found' });
+                } catch (simpleErr) {
+                    try { await conn.rollback(); } catch {}
+                    if (simpleErr && (simpleErr.errno === 1451 || simpleErr.code === 'ER_ROW_IS_REFERENCED_2')) {
+                        return res.status(409).json({ message: 'Cannot delete faculty due to related records (scores/sections). Append ?cascade=true to delete related records too.' });
+                    }
+                    throw simpleErr;
+                }
+            }
+        } catch (txErr) {
+            try { await conn.rollback(); } catch {}
+            // Translate FK constraint to a friendly message
+            if (txErr && (txErr.errno === 1451 || txErr.code === 'ER_ROW_IS_REFERENCED_2')) {
+                return res.status(409).json({ message: 'Cannot delete faculty due to related records (scores/sections). Append ?cascade=true to delete related records too.' });
+            }
+            throw txErr;
+        } finally {
+            conn.release();
+        }
+    } catch (error) {
+        console.error('Error deleting faculty:', error);
+        return res.status(500).json({ message: 'Failed to delete faculty.' });
+    }
+});
+
 app.get('/api/courses', async (req, res) => {
      try {
         const [rows] = await pool.query(`
@@ -274,6 +413,166 @@ app.get('/api/courses', async (req, res) => {
     } catch (error) {
         console.error("Error fetching courses:", error);
         res.status(500).json({ message: "Failed to fetch courses." });
+    }
+});
+
+// Delete Course endpoint (Admin) with FK safety and optional cascade
+// DELETE /api/courses/:id[?cascade=true]
+app.delete('/api/courses/:id', async (req, res) => {
+    const raw = req.params.id;
+    if (!raw) return res.status(400).json({ message: 'Course id is required.' });
+    const id = Number(raw);
+    if (!Number.isFinite(id)) return res.status(400).json({ message: 'Course id must be a number.' });
+    try {
+        const conn = await pool.getConnection();
+        try {
+            await conn.beginTransaction();
+
+            const doCascade = String(req.query.cascade || '').toLowerCase() === 'true';
+
+            if (doCascade) {
+                // Remove dependent rows that reference course(course_id)
+                const [fkRows] = await conn.query(
+                    `SELECT TABLE_NAME, COLUMN_NAME
+                     FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                     WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+                       AND REFERENCED_TABLE_NAME = 'course'
+                       AND REFERENCED_COLUMN_NAME = 'course_id'`
+                );
+                for (const row of fkRows) {
+                    const tbl = row.TABLE_NAME;
+                    const col = row.COLUMN_NAME;
+                    try {
+                        await conn.query(`DELETE FROM \`${tbl}\` WHERE \`${col}\` = ?`, [id]);
+                    } catch (e) {
+                        if (!(e && (e.code === 'ER_NO_SUCH_TABLE' || e.code === 'ER_BAD_FIELD_ERROR'))) {
+                            throw e;
+                        }
+                    }
+                }
+
+                const [result] = await conn.query('DELETE FROM course WHERE course_id = ? LIMIT 1', [id]);
+                await conn.commit();
+                if ((result.affectedRows || 0) > 0) return res.sendStatus(204);
+                return res.status(404).json({ message: 'Course not found' });
+            } else {
+                // Try simple delete; if FK blocks, report conflict and advise cascade
+                try {
+                    const [result] = await conn.query('DELETE FROM course WHERE course_id = ? LIMIT 1', [id]);
+                    await conn.commit();
+                    if ((result.affectedRows || 0) > 0) return res.sendStatus(204);
+                    return res.status(404).json({ message: 'Course not found' });
+                } catch (simpleErr) {
+                    try { await conn.rollback(); } catch {}
+                    if (simpleErr && (simpleErr.errno === 1451 || simpleErr.code === 'ER_ROW_IS_REFERENCED_2')) {
+                        return res.status(409).json({ message: 'Cannot delete course due to related records (scores/attendance/timetable/enrollments). Append ?cascade=true to delete related records too.' });
+                    }
+                    throw simpleErr;
+                }
+            }
+        } catch (txErr) {
+            try { await conn.rollback(); } catch {}
+            if (txErr && (txErr.errno === 1451 || txErr.code === 'ER_ROW_IS_REFERENCED_2')) {
+                return res.status(409).json({ message: 'Cannot delete course due to related records (scores/attendance/timetable/enrollments). Append ?cascade=true to delete related records too.' });
+            }
+            throw txErr;
+        } finally {
+            conn.release();
+        }
+    } catch (error) {
+        console.error('Error deleting course:', error);
+        return res.status(500).json({ message: 'Failed to delete course.' });
+    }
+});
+
+// 3b. Timetable Endpoints
+// GET /api/timetable?faculty_id=&course_id=&day=
+// day_of_week: 1=Mon ... 7=Sun
+app.get('/api/timetable', async (req, res) => {
+    let conn;
+    try {
+        conn = await pool.getConnection();
+        await ensureTimetableTable(conn);
+        // If table still missing, return empty
+        const [exists] = await conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'timetable'`);
+        if (exists.length === 0) return res.json([]);
+
+        const { faculty_id, course_id, day } = req.query;
+        const where = [];
+        const params = [];
+        if (faculty_id) { where.push('t.faculty_id = ?'); params.push(faculty_id); }
+        if (course_id) { where.push('t.course_id = ?'); params.push(course_id); }
+        if (day) { where.push('t.day_of_week = ?'); params.push(Number(day)); }
+
+        const sql = `
+          SELECT t.*, c.title AS course_title
+          FROM timetable t
+          LEFT JOIN course c ON c.course_id = t.course_id
+          ${where.length ? ('WHERE ' + where.join(' AND ')) : ''}
+          ORDER BY t.day_of_week ASC, t.start_time ASC`;
+        const [rows] = await conn.query(sql, params);
+        return res.json(rows);
+    } catch (error) {
+        console.error('Error fetching timetable:', error);
+        return res.json([]);
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
+// POST /api/timetable (create or bulk create)
+// Body: { faculty_id, course_id, day_of_week, start_time, end_time, room?, section? } | { slots: [...] }
+app.post('/api/timetable', async (req, res) => {
+    const payload = req.body || {};
+    const slots = Array.isArray(payload.slots) ? payload.slots : [payload];
+    let conn;
+    try {
+        conn = await pool.getConnection();
+        await ensureTimetableTable(conn);
+        const [exists] = await conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'timetable'`);
+        if (exists.length === 0) return res.status(500).json({ message: 'Timetable table missing and could not be created.' });
+
+        const ok = [];
+        for (const s of slots) {
+            const { faculty_id, course_id, day_of_week, start_time, end_time, room, section } = s || {};
+            if (!faculty_id || !course_id || !day_of_week || !start_time || !end_time) {
+                continue; // skip invalid slot
+            }
+            await conn.query(
+                `INSERT INTO timetable (faculty_id, course_id, day_of_week, start_time, end_time, room, section)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [faculty_id, course_id, Number(day_of_week), start_time, end_time, room || null, section || null]
+            );
+            ok.push(true);
+        }
+        return res.status(201).json({ message: 'Timetable saved', count: ok.length });
+    } catch (error) {
+        console.error('Error saving timetable:', error);
+        if (error && error.code === 'ER_NO_REFERENCED_ROW_2') {
+            return res.status(400).json({ message: 'Invalid foreign key (faculty_id or course_id)', detail: error.sqlMessage });
+        }
+        return res.status(500).json({ message: 'Failed to save timetable.' });
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
+// DELETE /api/timetable/:id
+app.delete('/api/timetable/:id', async (req, res) => {
+    let conn;
+    try {
+        conn = await pool.getConnection();
+        await ensureTimetableTable(conn);
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id)) return res.status(400).json({ message: 'Invalid id' });
+        const [result] = await conn.query('DELETE FROM timetable WHERE id = ? LIMIT 1', [id]);
+        if ((result.affectedRows || 0) > 0) return res.sendStatus(204);
+        return res.status(404).json({ message: 'Not found' });
+    } catch (error) {
+        console.error('Error deleting timetable slot:', error);
+        return res.status(500).json({ message: 'Failed to delete timetable slot.' });
+    } finally {
+        if (conn) conn.release();
     }
 });
 
@@ -342,8 +641,17 @@ app.post('/api/students', async (req, res) => {
         res.status(201).json(rows[0] || { student_id: finalStudentId });
     } catch (error) {
         console.error('Error adding student:', error);
+        // Duplicate entry handling - give a clearer message about which field caused the conflict
         if (error && error.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({ message: 'Student with given unique field already exists.', error: error.sqlMessage });
+            const sqlMsg = error.sqlMessage || '';
+            // Example sqlMessage: "Duplicate entry 'abc' for key 'student.student_id'"
+            const match = sqlMsg.match(/for key '\s*([^']+)'/i) || sqlMsg.match(/for key `([^`]+)`/i);
+            let keyName = match ? match[1] : null;
+            if (keyName && keyName.includes('.')) {
+                keyName = keyName.split('.').pop();
+            }
+            const prettyField = keyName || 'unique field';
+            return res.status(409).json({ message: `Duplicate ${prettyField} already exists.`, detail: sqlMsg });
         }
         if (error && error.code === 'ER_NO_REFERENCED_ROW_2') {
             return res.status(400).json({ message: 'Invalid foreign key reference (program_id or department).', error: error.sqlMessage });
@@ -530,6 +838,134 @@ app.get('/api/scores', async (req, res) => {
         } catch (e2) {
             return res.json([]);
         }
+    }
+});
+
+
+// 8. Attendance endpoints
+// Link attendance to student (student_id) and course (course_id)
+// Expected minimal columns in `attendance`: student_id (FK), course_id (FK), date (DATE), status (VARCHAR), remarks (TEXT nullable)
+// We dynamically detect the date column among: 'date', 'att_date', 'attendance_date'
+
+// Helper to detect attendance columns and build accessors
+async function getAttendanceColumns(conn) {
+    const [cols] = await conn.query(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'attendance'`
+    );
+    const names = new Set(cols.map(c => c.COLUMN_NAME));
+    const dateCol = names.has('date') ? 'date' : (names.has('att_date') ? 'att_date' : (names.has('attendance_date') ? 'attendance_date' : null));
+    const statusCol = names.has('status') ? 'status' : null;
+    const remarksCol = names.has('remarks') ? 'remarks' : (names.has('note') ? 'note' : null);
+    const studentCol = names.has('student_id') ? 'student_id' : null;
+    const courseCol = names.has('course_id') ? 'course_id' : null;
+    return { dateCol, statusCol, remarksCol, studentCol, courseCol, hasTable: cols.length > 0 };
+}
+
+// GET /api/attendance?student_id=&course_id=&date=
+app.get('/api/attendance', async (req, res) => {
+    let conn;
+    try {
+        conn = await pool.getConnection();
+        const { dateCol, statusCol, remarksCol, studentCol, courseCol, hasTable } = await getAttendanceColumns(conn);
+        if (!hasTable || !dateCol || !statusCol || !studentCol || !courseCol) {
+            return res.json([]); // Graceful empty if table or required cols missing
+        }
+
+        const { student_id, course_id, date } = req.query;
+        const where = [];
+        const params = [];
+        if (student_id) { where.push(`a.\`${studentCol}\` = ?`); params.push(student_id); }
+        if (course_id) { where.push(`a.\`${courseCol}\` = ?`); params.push(course_id); }
+        if (date) { where.push(`a.\`${dateCol}\` = ?`); params.push(date); }
+
+        const sql = `
+            SELECT 
+                a.\`${studentCol}\` AS student_id,
+                a.\`${courseCol}\` AS course_id,
+                a.\`${dateCol}\` AS date,
+                a.\`${statusCol}\` AS status,
+                ${remarksCol ? `a.\`${remarksCol}\` AS remarks,` : `NULL AS remarks,`}
+                CONCAT(s.first_name, ' ', s.last_name) AS student_name,
+                s.email AS student_email,
+                c.title AS course_title
+            FROM attendance a
+            LEFT JOIN student s ON s.student_id = a.\`${studentCol}\`
+            LEFT JOIN course c ON c.course_id = a.\`${courseCol}\`
+            ${where.length ? ('WHERE ' + where.join(' AND ')) : ''}
+            ORDER BY a.\`${dateCol}\` DESC, a.\`${studentCol}\` ASC`;
+        const [rows] = await conn.query(sql, params);
+        return res.json(rows);
+    } catch (error) {
+        console.error('Error fetching attendance:', error);
+        return res.json([]);
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
+// POST /api/attendance
+// Body: { student_id, course_id, date: 'YYYY-MM-DD', status: 'Present'|'Absent', remarks? }
+// Upsert behavior: if unique key on (student_id, course_id, date) exists, use ON DUPLICATE KEY UPDATE; else fallback to select+update or insert
+app.post('/api/attendance', async (req, res) => {
+    const { student_id, course_id, date, status, remarks } = req.body || {};
+    if (!student_id || !course_id || !date || !status) {
+        return res.status(400).json({ message: 'student_id, course_id, date, and status are required.' });
+    }
+    let conn;
+    try {
+        conn = await pool.getConnection();
+        const { dateCol, statusCol, remarksCol, studentCol, courseCol, hasTable } = await getAttendanceColumns(conn);
+        if (!hasTable || !dateCol || !statusCol || !studentCol || !courseCol) {
+            return res.status(500).json({ message: 'Missing attendance table/columns in database.' });
+        }
+
+        // Try ON DUPLICATE KEY first
+        const tryUpsert = async () => {
+            const sql = `INSERT INTO attendance (\`${studentCol}\`, \`${courseCol}\`, \`${dateCol}\`, \`${statusCol}\`${remarksCol ? `, \`${remarksCol}\`` : ''})
+                         VALUES (?, ?, ?, ?${remarksCol ? ', ?' : ''})
+                         ON DUPLICATE KEY UPDATE \`${statusCol}\` = VALUES(\`${statusCol}\`)${remarksCol ? `, \`${remarksCol}\` = VALUES(\`${remarksCol}\`)` : ''}`;
+            const params = [student_id, course_id, date, status];
+            if (remarksCol) params.push(remarks || null);
+            await conn.query(sql, params);
+        };
+
+        try {
+            await tryUpsert();
+        } catch (err) {
+            // If table has no unique key, fallback to select+update or insert
+            if (err && err.code === 'ER_DUP_ENTRY') {
+                // still a dup, but handled; rethrow to outer
+                throw err;
+            }
+            // Fallback flow
+            const [existing] = await conn.query(
+                `SELECT 1 FROM attendance WHERE \`${studentCol}\` = ? AND \`${courseCol}\` = ? AND \`${dateCol}\` = ? LIMIT 1`,
+                [student_id, course_id, date]
+            );
+            if (existing.length > 0) {
+                const upSql = `UPDATE attendance SET \`${statusCol}\` = ?, ${remarksCol ? `\`${remarksCol}\` = ?, ` : ''}\`${dateCol}\` = \`${dateCol}\` WHERE \`${studentCol}\` = ? AND \`${courseCol}\` = ? AND \`${dateCol}\` = ?`;
+                const upParams = remarksCol ? [status, (remarks || null), student_id, course_id, date] : [status, student_id, course_id, date];
+                await conn.query(upSql, upParams);
+            } else {
+                const insSql = `INSERT INTO attendance (\`${studentCol}\`, \`${courseCol}\`, \`${dateCol}\`, \`${statusCol}\`${remarksCol ? `, \`${remarksCol}\`` : ''}) VALUES (?, ?, ?, ?${remarksCol ? ', ?' : ''})`;
+                const insParams = [student_id, course_id, date, status];
+                if (remarksCol) insParams.push(remarks || null);
+                await conn.query(insSql, insParams);
+            }
+        }
+
+        return res.status(201).json({ message: 'Attendance saved.' });
+    } catch (error) {
+        console.error('Error saving attendance:', error);
+        if (error && error.code === 'ER_NO_SUCH_TABLE') {
+            return res.status(500).json({ message: 'Missing table `attendance`. Please create the table or adjust backend to your schema.' });
+        }
+        if (error && error.code === 'ER_NO_REFERENCED_ROW_2') {
+            return res.status(400).json({ message: 'Invalid foreign key (student_id or course_id)', detail: error.sqlMessage });
+        }
+        return res.status(500).json({ message: 'Failed to save attendance.' });
+    } finally {
+        if (conn) conn.release();
     }
 });
 

@@ -41,6 +41,7 @@ const ROLES_CONFIG = {
       { name: "Students", icon: Users, page: "students" },
       { name: "Grade Entry", icon: ClipboardCheck, page: "grades" },
       { name: "Attendance", icon: CalendarCheck, page: "attendance" },
+      { name: "Timetable", icon: CalendarCheck, page: "timetable" },
     ]
   },
   admin: {
@@ -51,6 +52,8 @@ const ROLES_CONFIG = {
       { name: "Faculty Management", icon: UserPlus, page: "faculty" }, 
       { name: "Student Management", icon: Users, page: "students" },
       { name: "Available Courses", icon: BookOpen, page: "courses" },
+      { name: "Attendance", icon: CalendarCheck, page: "attendance" },
+      { name: "Timetable", icon: CalendarCheck, page: "timetable" },
     ]
   }
 };
@@ -301,6 +304,37 @@ function Modal({ isOpen, onClose, title, children }) {
 
 // --- PAGE COMPONENTS ---
 
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, info) {
+    console.error('ErrorBoundary caught:', error, info);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="p-6">
+          <Card className="border-rose-300 dark:border-rose-800">
+            <CardHeader>
+              <CardTitle>Something went wrong</CardTitle>
+              <CardDescription className="text-rose-600 dark:text-rose-300">{String(this.state.error)}</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-gray-600 dark:text-gray-400">Try navigating to another page and back, or refresh. Check console for details.</p>
+            </CardContent>
+          </Card>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function LoginPage({ onLogin, setNotification }) {
   const [role, setRole] = useState('student');
   const [email, setEmail] = useState('');
@@ -473,6 +507,8 @@ function DataProvider({ children, setNotification }) {
   const [courses, setCourses] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [apiAvailable, setApiAvailable] = useState(true);
+  // Cross-page selection: allow admin to pick a faculty and jump to Timetable
+  const [selectedFacultyIdForTimetable, setSelectedFacultyIdForTimetable] = useState(null);
 
   // Utility: normalize API responses that may be { value: [...] } or an array
   function asArray(payload) {
@@ -562,7 +598,10 @@ function DataProvider({ children, setNotification }) {
     courses, setCourses,
     isLoading,
     refetchData: fetchData // Function to allow refetching
-    , apiAvailable
+    , apiAvailable,
+    // Timetable cross-navigation selection
+    selectedFacultyIdForTimetable,
+    setSelectedFacultyIdForTimetable,
   };
 
   return (
@@ -578,6 +617,11 @@ function MainDashboard({ user, onLogout, setNotification }) {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
   const [darkMode, setDarkMode] = useState(true);
+  const [isNotifOpen, setIsNotifOpen] = useState(false);
+  const [notifications, setNotifications] = useState([
+    { id: 'n1', title: 'Welcome to SmartExam', message: 'You are logged in.', time: 'Just now', read: false },
+    { id: 'n2', title: 'System Update', message: 'Scores module supports updates.', time: '1h ago', read: true },
+  ]);
 
   // Data context
   const dataContext = React.useContext(DataContext);
@@ -630,8 +674,8 @@ function MainDashboard({ user, onLogout, setNotification }) {
         )}
         animate={isSidebarOpen ? 'open' : 'closed'}
         variants={{
-          open: { width: isMobile ? '256px' : '256px', x: 0 },
-          closed: { width: isMobile ? '0px' : '80px', x: isMobile ? '-256px' : '0px' }
+          open: { width: isMobile ? '300px' : '300px', x: 0 },
+          closed: { width: isMobile ? '0px' : '80px', x: isMobile ? '-300px' : '0px' }
         }}
         transition={{ type: 'tween', duration: 0.3 }}
       >
@@ -694,8 +738,11 @@ function MainDashboard({ user, onLogout, setNotification }) {
             <Button variant="ghost" size="icon" onClick={() => setDarkMode(!darkMode)}>
               {darkMode ? <Sun /> : <Moon />}
             </Button>
-            <Button variant="ghost" size="icon">
+            <Button variant="ghost" size="icon" className="relative" onClick={() => setIsNotifOpen(o => !o)}>
               <Bell />
+              {notifications.some(n => !n.read) && (
+                <span className="absolute -top-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-rose-500 ring-2 ring-white dark:ring-gray-950" />
+              )}
             </Button>
             <div className="flex items-center space-x-2">
               <div className="h-9 w-9 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center text-white font-medium">
@@ -724,12 +771,23 @@ function MainDashboard({ user, onLogout, setNotification }) {
                 exit="out"
                 transition={pageTransition}
               >
-                <PageContent page={currentPage} user={user} setNotification={setNotification} />
+                <ErrorBoundary>
+                  <PageContent page={currentPage} user={user} setNotification={setNotification} setPage={setCurrentPage} />
+                </ErrorBoundary>
               </motion.div>
             </AnimatePresence>
           )}
         </main>
       </div>
+      {/* Notification Panel */}
+      <NotificationPanel
+        isOpen={isNotifOpen}
+        onClose={() => setIsNotifOpen(false)}
+        notifications={notifications}
+        onMarkAllRead={() => setNotifications(prev => prev.map(n => ({ ...n, read: true })))}
+        onClear={() => setNotifications([])}
+        onToggleRead={(id) => setNotifications(prev => prev.map(n => n.id === id ? ({ ...n, read: !n.read }) : n))}
+      />
     </div>
   );
 }
@@ -748,9 +806,12 @@ function NavItem({ item, isActive, isSidebarOpen, onClick }) {
       onClick={onClick}
       title={isSidebarOpen ? '' : name}
     >
-      <Icon className={cn("h-5 w-5", isSidebarOpen && "mr-3")} />
+      {/* Fixed-width icon column to align labels perfectly */}
+      <span className={cn("w-6 flex-shrink-0 flex items-center justify-center", isSidebarOpen && "mr-3")}> 
+        <Icon className="h-5 w-5" />
+      </span>
       <motion.span
-        className="overflow-hidden whitespace-nowrap"
+        className="overflow-hidden whitespace-nowrap text-left flex-1 min-w-0"
         animate={{ 
           opacity: isSidebarOpen ? 1 : 0, 
           width: isSidebarOpen ? 'auto' : 0,
@@ -764,7 +825,7 @@ function NavItem({ item, isActive, isSidebarOpen, onClick }) {
   );
 }
 
-function PageContent({ page, user, setNotification }) {
+function PageContent({ page, user, setNotification, setPage }) {
   // Simple router
   switch (page) {
     case 'dashboard':
@@ -777,10 +838,12 @@ function PageContent({ page, user, setNotification }) {
       return <ScoresPage user={user} />;
     case 'attendance':
       return <AttendancePage user={user} />;
+    case 'timetable':
+      return <TimetablePage user={user} />;
     case 'students':
       return <StudentManagementPage user={user} setNotification={setNotification} />;
     case 'faculty':
-      return <FacultyManagementPage user={user} setNotification={setNotification} />;
+      return <FacultyManagementPage user={user} setNotification={setNotification} setPage={setPage} />;
     default:
       return <DashboardPage user={user} />;
   }
@@ -967,6 +1030,270 @@ function StatCard({ title, value, icon: Icon, color }) {
   );
 }
 
+// Timetable Page (read-only for faculty)
+function TimetablePage({ user }) {
+  const isFaculty = user.role === 'faculty';
+  const isAdmin = user.role === 'admin';
+  const { faculty, courses, selectedFacultyIdForTimetable, setSelectedFacultyIdForTimetable } = React.useContext(DataContext);
+  const [slots, setSlots] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [facultyFilter, setFacultyFilter] = useState('all');
+  const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [form, setForm] = useState({
+    faculty_id: '',
+    course_id: '',
+    day_of_week: 1,
+    start_time: '09:00',
+    end_time: '10:00',
+    room: '',
+    section: ''
+  });
+
+  const days = [
+    { n: 1, name: 'Monday' },
+    { n: 2, name: 'Tuesday' },
+    { n: 3, name: 'Wednesday' },
+    { n: 4, name: 'Thursday' },
+    { n: 5, name: 'Friday' },
+    { n: 6, name: 'Saturday' },
+  ];
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (isFaculty) params.set('faculty_id', user.id);
+      if (isAdmin && facultyFilter !== 'all') params.set('faculty_id', facultyFilter);
+      const res = await fetch(`${API_URL}/timetable?${params.toString()}`);
+      const data = await res.json().catch(() => []);
+      const arr = Array.isArray(data) ? data : (data.value || []);
+      setSlots(arr);
+    } catch (_) {
+      setSlots([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [user.id, facultyFilter]);
+
+  // If admin navigated here with a specific faculty selected, apply it once
+  useEffect(() => {
+    if (isAdmin && selectedFacultyIdForTimetable) {
+      setFacultyFilter(String(selectedFacultyIdForTimetable));
+      // Optional: clear after applying so future visits aren't sticky
+      setSelectedFacultyIdForTimetable(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedFacultyIdForTimetable, isAdmin]);
+
+  const slotsByDay = useMemo(() => {
+    const m = new Map();
+    for (const d of days) m.set(d.n, []);
+    for (const s of slots) {
+      const dn = Number(s.day_of_week || s.day || 0);
+      if (!m.has(dn)) m.set(dn, []);
+      m.get(dn).push(s);
+    }
+    for (const [k, arr] of m) {
+      arr.sort((a, b) => String(a.start_time).localeCompare(String(b.start_time)));
+    }
+    return m;
+  }, [slots]);
+
+  const fmtTime = (t) => (t ? String(t).slice(0,5) : '');
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+        <h1 className="text-3xl font-bold dark:text-white">{isFaculty ? 'My Timetable' : 'Timetable'}</h1>
+        <div className="flex items-center gap-2 w-full md:w-auto">
+          {isAdmin && (
+            <div className="min-w-[220px]">
+              <Select value={facultyFilter} onChange={(e) => setFacultyFilter(e.target.value)}>
+                <SelectItem value="all">All Faculty</SelectItem>
+                {faculty.map(f => (
+                  <SelectItem key={f.id} value={String(f.id)}>{f.name} ({f.id})</SelectItem>
+                ))}
+              </Select>
+            </div>
+          )}
+          <Button onClick={load} isLoading={loading}>Refresh</Button>
+          {isAdmin && (
+            <Button onClick={() => {
+              const firstFaculty = faculty[0]?.id || '';
+              const firstCourse = courses[0]?.id || '';
+              setForm(prev => ({ ...prev, faculty_id: String(firstFaculty), course_id: String(firstCourse) }));
+              setIsAddOpen(true);
+            }}>
+              <Plus className="h-4 w-4 mr-2" /> Add Slot
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <Card>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Day</TableHead>
+                <TableHead>Time</TableHead>
+                <TableHead>Course</TableHead>
+                {isAdmin && <TableHead>Faculty</TableHead>}
+                <TableHead>Room</TableHead>
+                <TableHead>Section</TableHead>
+                {isAdmin && <TableHead>Actions</TableHead>}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {days.map((d) => {
+                const daySlots = slotsByDay.get(d.n) || [];
+                if (daySlots.length === 0) {
+                  return (
+                    <TableRow key={d.n}>
+                      <TableCell className="font-medium">{d.name}</TableCell>
+                      <TableCell colSpan={isAdmin ? 6 : 4} className="text-gray-500">No classes</TableCell>
+                    </TableRow>
+                  );
+                }
+                return (
+                  <Fragment key={d.n}>
+                    <TableRow>
+                      <TableCell colSpan={isAdmin ? 7 : 5} className="bg-gray-50 dark:bg-gray-800/50 font-semibold text-gray-700 dark:text-gray-200">{d.name}</TableCell>
+                    </TableRow>
+                    {daySlots.map((s, idx) => (
+                      <TableRow key={`${d.n}-${idx}`}>
+                        <TableCell className="text-gray-500">{''}</TableCell>
+                        <TableCell>{fmtTime(s.start_time)} - {fmtTime(s.end_time)}</TableCell>
+                        <TableCell>{s.course_title || courses.find(c => c.id === s.course_id)?.title || s.course_id}</TableCell>
+                        {isAdmin && (
+                          <TableCell>{faculty.find(f => String(f.id) === String(s.faculty_id))?.name || s.faculty_id}</TableCell>
+                        )}
+                        <TableCell>{s.room || '-'}</TableCell>
+                        <TableCell>{s.section || '-'}</TableCell>
+                        {isAdmin && (
+                          <TableCell>
+                            <Button
+                              variant="destructive"
+                              size="sm"
+                              onClick={async () => {
+                                if (!s.id) { alert('Missing slot id.'); return; }
+                                const yes = confirm('Delete this timetable slot?');
+                                if (!yes) return;
+                                try {
+                                  const res = await fetch(`${API_URL}/timetable/${encodeURIComponent(s.id)}`, { method: 'DELETE' });
+                                  if (!(res.ok || res.status === 204)) {
+                                    let msg = '';
+                                    try { const j = await res.json(); msg = j.message || ''; } catch (_) {}
+                                    throw new Error(msg || `Failed to delete (${res.status}).`);
+                                  }
+                                  await load();
+                                } catch (e) {
+                                  alert(e.message);
+                                }
+                              }}
+                            >
+                              Delete
+                            </Button>
+                          </TableCell>
+                        )}
+                      </TableRow>
+                    ))}
+                  </Fragment>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+
+      {/* Add Slot Modal (Admin) */}
+      {isAdmin && (
+        <Modal isOpen={isAddOpen} onClose={() => setIsAddOpen(false)} title="Add Timetable Slot">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-1">
+              <Label>Faculty</Label>
+              <Select value={form.faculty_id} onChange={(e) => setForm(prev => ({ ...prev, faculty_id: e.target.value }))}>
+                {faculty.length === 0 && <SelectItem value="">No faculty</SelectItem>}
+                {faculty.map(f => (
+                  <SelectItem key={f.id} value={String(f.id)}>{f.name} ({f.id})</SelectItem>
+                ))}
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>Course</Label>
+              <Select value={form.course_id} onChange={(e) => setForm(prev => ({ ...prev, course_id: e.target.value }))}>
+                {courses.length === 0 && <SelectItem value="">No courses</SelectItem>}
+                {courses.map(c => (
+                  <SelectItem key={c.id} value={String(c.id)}>{c.title} ({c.id})</SelectItem>
+                ))}
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>Day</Label>
+              <Select value={String(form.day_of_week)} onChange={(e) => setForm(prev => ({ ...prev, day_of_week: Number(e.target.value) }))}>
+                <SelectItem value="1">Monday</SelectItem>
+                <SelectItem value="2">Tuesday</SelectItem>
+                <SelectItem value="3">Wednesday</SelectItem>
+                <SelectItem value="4">Thursday</SelectItem>
+                <SelectItem value="5">Friday</SelectItem>
+                <SelectItem value="6">Saturday</SelectItem>
+                <SelectItem value="7">Sunday</SelectItem>
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>Start Time</Label>
+              <Input type="time" value={form.start_time} onChange={(e) => setForm(prev => ({ ...prev, start_time: e.target.value }))} />
+            </div>
+            <div className="space-y-1">
+              <Label>End Time</Label>
+              <Input type="time" value={form.end_time} onChange={(e) => setForm(prev => ({ ...prev, end_time: e.target.value }))} />
+            </div>
+            <div className="space-y-1">
+              <Label>Room</Label>
+              <Input value={form.room} onChange={(e) => setForm(prev => ({ ...prev, room: e.target.value }))} placeholder="A-101" />
+            </div>
+            <div className="space-y-1">
+              <Label>Section</Label>
+              <Input value={form.section} onChange={(e) => setForm(prev => ({ ...prev, section: e.target.value }))} placeholder="CSE-3A" />
+            </div>
+          </div>
+          <CardFooter className="justify-end gap-2 mt-4">
+            <Button variant="outline" type="button" onClick={() => setIsAddOpen(false)} disabled={isSaving}>Cancel</Button>
+            <Button type="button" isLoading={isSaving} onClick={async () => {
+              // Basic validation
+              if (!form.faculty_id || !form.course_id) { alert('Select faculty and course'); return; }
+              if (!form.start_time || !form.end_time) { alert('Select time range'); return; }
+              if (form.end_time <= form.start_time) { alert('End time must be after start time'); return; }
+              setIsSaving(true);
+              try {
+                const payload = { ...form, faculty_id: Number(form.faculty_id), course_id: Number(form.course_id) };
+                const res = await fetch(`${API_URL}/timetable`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payload)
+                });
+                if (!res.ok) {
+                  const err = await res.json().catch(() => ({}));
+                  throw new Error(err.message || 'Failed to save');
+                }
+                setIsAddOpen(false);
+                await load();
+              } catch (e) {
+                alert(e.message);
+              } finally {
+                setIsSaving(false);
+              }
+            }}>Save</Button>
+          </CardFooter>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 /**
  * CoursesPage
  * Updated for Admin role (Add Course)
@@ -980,6 +1307,45 @@ function CoursesPage({ user, setNotification }) {
   const [newCourse, setNewCourse] = useState({ 
     id: '', title: '', credits: 4, deptId: mockDepartments[0].id 
   });
+  // Filters and search
+  const [searchTerm, setSearchTerm] = useState('');
+  const [deptFilter, setDeptFilter] = useState('all');
+
+  const handleDeleteCourse = async (rawId) => {
+    const id = Number(rawId);
+    if (!Number.isFinite(id)) {
+      alert('Invalid course id.');
+      return;
+    }
+    const yes = confirm('Delete this course? This action is permanent.');
+    if (!yes) return;
+    try {
+      let res = await fetch(`${API_URL}/courses/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!(res.ok || res.status === 204)) {
+        let msg = '';
+        try { const j = await res.json(); msg = j.message || ''; } catch (_) {}
+        if (res.status === 409 && /related\s+records/i.test(msg)) {
+          const doCascade = confirm('This course has related records (scores/attendance/timetable). Delete them as well?');
+          if (doCascade) {
+            res = await fetch(`${API_URL}/courses/${encodeURIComponent(id)}?cascade=true`, { method: 'DELETE' });
+            if (!(res.ok || res.status === 204)) {
+              let msg2 = '';
+              try { const j2 = await res.json(); msg2 = j2.message || ''; } catch (_) {}
+              throw new Error(msg2 || `Failed to delete course (${res.status}).`);
+            }
+          } else {
+            throw new Error(msg || 'Delete cancelled.');
+          }
+        } else {
+          throw new Error(msg || `Failed to delete course (${res.status}).`);
+        }
+      }
+      setCourses(prev => prev.filter(c => Number(c.id) !== id));
+      setNotification && setNotification({ type: 'success', message: 'Course deleted.' });
+    } catch (error) {
+      setNotification && setNotification({ type: 'error', message: error.message });
+    }
+  };
 
   const handleAddCourse = async (e) => {
     e.preventDefault();
@@ -994,8 +1360,12 @@ function CoursesPage({ user, setNotification }) {
       if (!response.ok) {
         throw new Error(addedCourse.message || 'Failed to add course.');
       }
-      
-      setCourses([addedCourse, ...courses]);
+      // Normalize department id field for UI rendering
+      const normalized = {
+        ...addedCourse,
+        dept_id: addedCourse.dept_id ?? addedCourse.deptId ?? addedCourse.department_id ?? newCourse.deptId,
+      };
+      setCourses([normalized, ...courses]);
       setIsAddCourseModalOpen(false);
       setNewCourse({ id: '', title: '', credits: 4, deptId: mockDepartments[0].id });
       setNotification({ type: 'success', message: 'Course added successfully!' });
@@ -1013,10 +1383,62 @@ function CoursesPage({ user, setNotification }) {
     setNewCourse(prev => ({ ...prev, [name]: name === 'credits' || name === 'deptId' ? parseInt(value) : value }));
   };
   
-  const getDepartmentName = (deptId) => {
-     const dept = mockDepartments.find(d => d.id === deptId);
-     return dept ? dept.name : 'Unknown';
+  const getDepartmentName = (deptLike) => {
+    if (!deptLike && deptLike !== 0) return 'Unknown';
+    // If a string name is provided, return if recognized
+    if (typeof deptLike === 'string') {
+     const byName = mockDepartments.find(d => d.name === deptLike);
+     return byName ? byName.name : deptLike;
+    }
+    const dept = mockDepartments.find(d => d.id === deptLike);
+    return dept ? dept.name : 'Unknown';
   };
+
+  // Helper to extract department id from a course, tolerant to various field names
+  const getDeptId = (course) => {
+    let id = course.dept_id ?? course.deptId ?? course.department_id;
+    if ((id == null || Number.isNaN(id)) && course.department_name) {
+      const byName = mockDepartments.find(d => d.name === course.department_name);
+      if (byName) id = byName.id;
+    }
+    return id;
+  };
+
+  // Apply search and department filter
+  const filteredCourses = React.useMemo(() => {
+    const q = searchTerm.trim().toLowerCase();
+    return courses.filter((c) => {
+      const deptId = getDeptId(c);
+      if (deptFilter !== 'all' && String(deptId) !== String(deptFilter)) return false;
+      if (!q) return true;
+      const deptName = getDepartmentName(deptId).toLowerCase();
+      return (
+        String(c.id).toLowerCase().includes(q) ||
+        String(c.title || '').toLowerCase().includes(q) ||
+        deptName.includes(q)
+      );
+    });
+  }, [courses, deptFilter, searchTerm]);
+
+  // Group by department when viewing all departments
+  const groupedCourses = React.useMemo(() => {
+    if (deptFilter !== 'all') {
+      const deptName = getDepartmentName(Number(deptFilter));
+      return [{ deptId: deptFilter, deptName, items: filteredCourses }];
+    }
+    const map = new Map();
+    for (const c of filteredCourses) {
+      const dId = getDeptId(c);
+      const key = dId ?? 'unknown';
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(c);
+    }
+    return Array.from(map.entries()).map(([deptId, items]) => ({
+      deptId,
+      deptName: getDepartmentName(deptId),
+      items,
+    }));
+  }, [filteredCourses, deptFilter]);
 
   return (
     <div className="space-y-6">
@@ -1030,6 +1452,26 @@ function CoursesPage({ user, setNotification }) {
             Add Course
           </Button>
         )}
+      </div>
+      {/* Filters/Search */}
+      <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+        <div className="flex items-center gap-3 w-full md:w-auto">
+          <div className="w-full md:w-80">
+            <Input
+              placeholder="Search by course id, title, or department..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+            />
+          </div>
+          <div className="min-w-[180px]">
+            <Select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)}>
+              <SelectItem key="all" value="all">All Departments</SelectItem>
+              {mockDepartments.map((d) => (
+                <SelectItem key={d.id} value={String(d.id)}>{d.name}</SelectItem>
+              ))}
+            </Select>
+          </div>
+        </div>
       </div>
       
       <Card>
@@ -1047,33 +1489,51 @@ function CoursesPage({ user, setNotification }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {courses.map((course) => (
-                <TableRow key={course.id}>
-                  <TableCell className="font-medium">{course.id}</TableCell>
-                  <TableCell>{course.title}</TableCell>
-                  {isAdmin && <TableCell>{getDepartmentName(course.dept_id)}</TableCell>}
-                  {!isAdmin && <TableCell>{isFaculty ? "45 / 60" : course.faculty}</TableCell>}
-                  <TableCell>{course.credits}</TableCell>
-                  {!isFaculty && !isAdmin && <TableCell className="text-right font-bold">{course.grade || 'N/A'}</TableCell>}
-                  {isAdmin && 
-                    <TableCell className="flex gap-2">
-                       <Button variant="destructive" size="sm" 
-                         disabled 
-                         title="Delete endpoint not implemented in server.js"
-                       >
-                         Delete
-                       </Button>
-                    </TableCell>
-                  }
-                </TableRow>
-              ))}
-              {courses.length === 0 && (
-                 <TableRow>
-                  <TableCell colSpan={isAdmin ? 5 : (isFaculty ? 4: 5) } className="text-center h-24 text-gray-500 dark:text-gray-400">
-                    No courses found.
-                  </TableCell>
-                </TableRow>
-              )}
+              {(() => {
+                const columnCount = 2 /* id,title */ + 1 /* credits */ + (isAdmin ? 1 : 0) + (!isAdmin ? 1 : 0) + ((!isFaculty && !isAdmin) ? 1 : 0) + (isAdmin ? 1 : 0);
+                if (groupedCourses.length === 0 || groupedCourses.every(g => g.items.length === 0)) {
+                  return (
+                    <TableRow>
+                      <TableCell colSpan={columnCount} className="text-center h-24 text-gray-500 dark:text-gray-400">
+                        No courses found.
+                      </TableCell>
+                    </TableRow>
+                  );
+                }
+                return groupedCourses.map((group) => (
+                  <React.Fragment key={String(group.deptId)}>
+                    <TableRow>
+                      <TableCell colSpan={columnCount} className="bg-gray-50 dark:bg-gray-800/50 font-semibold text-gray-700 dark:text-gray-200">
+                        {group.deptName}
+                      </TableCell>
+                    </TableRow>
+                    {group.items.map((course) => (
+                      <TableRow key={course.id}>
+                        <TableCell className="font-medium">{course.id}</TableCell>
+                        <TableCell>{course.title}</TableCell>
+                        {isAdmin && (
+                          <TableCell>
+                            {getDepartmentName(
+                              course.dept_id ?? course.deptId ?? course.department_id ?? course.department_name ?? course.department
+                            )}
+                          </TableCell>
+                        )}
+                        {!isAdmin && <TableCell>{isFaculty ? "45 / 60" : course.faculty}</TableCell>}
+                        <TableCell>{course.credits}</TableCell>
+                        {!isFaculty && !isAdmin && <TableCell className="text-right font-bold">{course.grade || 'N/A'}</TableCell>}
+                        {isAdmin && 
+                  <TableCell className="flex gap-2">
+                    <Button variant="destructive" size="sm" onClick={() => handleDeleteCourse(Number(course.id))}>
+                               Delete
+                             </Button>
+                          </TableCell>
+                        }
+                      </TableRow>
+                    ))}
+                  </React.Fragment>
+                ));
+              })()}
+              
             </TableBody>
           </Table>
         </CardContent>
@@ -1125,6 +1585,17 @@ function ScoresPage({ user }) {
   const { apiAvailable } = React.useContext(DataContext);
 
   const [scores, setScores] = useState([]);
+  // Inline edit a single score row
+  const [rowEditKey, setRowEditKey] = useState(null);
+  const [rowEditScore, setRowEditScore] = useState('');
+  // Batch grade entry state (faculty)
+  const [selectedCourseId, setSelectedCourseId] = useState(courses[0]?.id || '');
+  const [assessment, setAssessment] = useState('Mid-Term');
+  const [maxMarks, setMaxMarks] = useState(100);
+  const [gradeEntries, setGradeEntries] = useState({}); // { student_id: number }
+  const [changedIds, setChangedIds] = useState(new Set());
+  const [isLoadingBatch, setIsLoadingBatch] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [newScore, setNewScore] = useState({
@@ -1213,16 +1684,169 @@ function ScoresPage({ user }) {
     return s ? (s.name || [s.first_name, s.last_name].filter(Boolean).join(' ')) : sid;
   };
 
+  // Prefill batch entries from server for selected course/assessment
+  const loadExistingScores = async () => {
+    if (!selectedCourseId) return;
+    setIsLoadingBatch(true);
+    try {
+      const params = new URLSearchParams({ course_id: String(selectedCourseId), exam_type: assessment });
+      const res = await fetch(`${API_URL}/scores?${params.toString()}`);
+      const data = await res.json().catch(() => []);
+      const arr = Array.isArray(data) ? data : (data.value || []);
+      const map = {};
+      for (const r of arr) {
+        if (r.student_id != null) map[r.student_id] = Number(r.score);
+      }
+      setGradeEntries(map);
+      // merge into local scores view as well
+      setScores(prev => {
+        const others = prev.filter(r => !(r.course_id === selectedCourseId && (r.exam_type || 'internal') === (assessment || 'internal')));
+        return [...arr, ...others];
+      });
+    } catch (_) {
+      // ignore
+    } finally {
+      setIsLoadingBatch(false);
+    }
+  };
+
+  // Compute filtered students for batch entry
+  const filteredStudents = useMemo(() => {
+    const q = searchTerm.trim().toLowerCase();
+    if (!q) return students;
+    return students.filter(s =>
+      (s.name || '').toLowerCase().includes(q) ||
+      (s.email || '').toLowerCase().includes(q) ||
+      String(s.student_id || s.id).toLowerCase().includes(q)
+    );
+  }, [students, searchTerm]);
+
+  const setEntry = (sid, val) => {
+    const num = val === '' ? '' : Number(val);
+    setGradeEntries(prev => ({ ...prev, [sid]: num }));
+    setChangedIds(prev => new Set(prev).add(sid));
+  };
+
+  const saveAllGrades = async () => {
+    if (!selectedCourseId) return alert('Select a course');
+    setIsLoadingBatch(true);
+    try {
+      const toSaveIds = Array.from(changedIds);
+      for (const sid of toSaveIds) {
+        const val = gradeEntries[sid];
+        if (val === '' || val == null) continue; // skip empty
+        if (Number(val) > Number(maxMarks)) {
+          throw new Error(`Score for ${studentName(sid)} exceeds Max Marks`);
+        }
+        const payload = { student_id: sid, course_id: selectedCourseId, faculty_id: user.id, score: Number(val), exam_type: assessment };
+        const res = await fetch(`${API_URL}/scores`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) {
+          const msg = await res.json().catch(() => ({}));
+          throw new Error(msg.message || `Failed to save score for ${studentName(sid)}`);
+        }
+      }
+      // Update local scores list for table view
+      setScores(prev => {
+        const others = prev.filter(r => !(r.course_id === selectedCourseId && (r.exam_type || 'internal') === (assessment || 'internal') && changedIds.has(r.student_id)));
+        const newOnes = Array.from(changedIds).map(sid => ({ student_id: sid, course_id: selectedCourseId, score: Number(gradeEntries[sid] || 0), exam_type: assessment }));
+        return [...newOnes, ...others];
+      });
+      setChangedIds(new Set());
+      alert('Grades saved');
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setIsLoadingBatch(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold dark:text-white">{isFaculty ? 'Grade Entry' : 'Scores'}</h1>
         {isFaculty && (
-          <Button onClick={() => setIsAddOpen(true)}>
-            <Plus className="h-4 w-4 mr-2" /> Add Score
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button onClick={() => setIsAddOpen(true)}>
+              <Plus className="h-4 w-4 mr-2" /> Add Score
+            </Button>
+          </div>
         )}
       </div>
+      {isFaculty && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Batch Grade Entry</CardTitle>
+            <CardDescription>Enter scores for each student in a course/assessment.</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="space-y-1">
+                <Label>Course</Label>
+                <Select value={selectedCourseId} onChange={(e) => setSelectedCourseId(e.target.value)}>
+                  {courses.map(c => (
+                    <SelectItem key={c.id} value={c.id}>{c.title}</SelectItem>
+                  ))}
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label>Assessment</Label>
+                <Input value={assessment} onChange={(e) => setAssessment(e.target.value)} placeholder="e.g., Mid-Term" />
+              </div>
+              <div className="space-y-1">
+                <Label>Max Marks</Label>
+                <Input type="number" min="1" value={maxMarks} onChange={(e) => setMaxMarks(Number(e.target.value))} />
+              </div>
+              <div className="flex items-end">
+                <Button className="w-full" onClick={loadExistingScores} isLoading={isLoadingBatch}>Load Existing</Button>
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <Input icon={Search} placeholder="Search students..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+              <div className="text-sm text-gray-600 dark:text-gray-400">Unsaved: {changedIds.size}</div>
+              <div className="flex-1" />
+              <Button onClick={saveAllGrades} isLoading={isLoadingBatch}>Save All</Button>
+            </div>
+            <div className="border rounded-lg overflow-hidden dark:border-gray-800">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Student</TableHead>
+                    <TableHead>Email</TableHead>
+                    <TableHead className="text-right">Score</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {filteredStudents.map(s => (
+                    <TableRow key={s.student_id || s.id}>
+                      <TableCell>{s.name} <span className="text-xs text-gray-500">({s.student_id || s.id})</span></TableCell>
+                      <TableCell>{s.email}</TableCell>
+                      <TableCell className="text-right">
+                        <Input
+                          type="number"
+                          min="0"
+                          max={maxMarks}
+                          value={(gradeEntries[s.student_id || s.id] ?? '')}
+                          onChange={(e) => setEntry(s.student_id || s.id, e.target.value)}
+                          className="w-24 ml-auto"
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {filteredStudents.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={3} className="text-center h-24 text-gray-500 dark:text-gray-400">No students found.</TableCell>
+                    </TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      )}
       <Card>
         <CardHeader>
           <CardTitle>Assessment Scores</CardTitle>
@@ -1237,21 +1861,81 @@ function ScoresPage({ user }) {
                 <TableHead>Assessment</TableHead>
                 <TableHead>Max</TableHead>
                 <TableHead className="text-right">Score</TableHead>
+                {isFaculty && <TableHead className="text-right">Actions</TableHead>}
               </TableRow>
             </TableHeader>
             <TableBody>
-              {scores.map((r) => (
-                <TableRow key={r.id || `${r.student_id}-${r.course_id}-${r.assessment}`}>
-                  <TableCell>{studentName(r.student_id)}</TableCell>
-                  <TableCell>{courseName(r.course_id)}</TableCell>
-                  <TableCell>{r.assessment}</TableCell>
-                  <TableCell>{r.max_marks}</TableCell>
-                  <TableCell className="text-right font-semibold">{r.score}</TableCell>
-                </TableRow>
-              ))}
+              {scores.map((r) => {
+                const key = r.id || `${r.student_id}-${r.course_id}-${r.exam_type || r.assessment || 'internal'}`;
+                const editing = rowEditKey === key;
+                const examLabel = r.exam_type || r.assessment || 'internal';
+                const maxLabel = r.max_marks ?? '';
+                return (
+                  <TableRow key={key}>
+                    <TableCell>{studentName(r.student_id)}</TableCell>
+                    <TableCell>{courseName(r.course_id)}</TableCell>
+                    <TableCell>{examLabel}</TableCell>
+                    <TableCell>{maxLabel}</TableCell>
+                    <TableCell className="text-right font-semibold">
+                      {editing ? (
+                        <Input
+                          type="number"
+                          value={rowEditScore}
+                          onChange={(e) => setRowEditScore(e.target.value)}
+                          className="w-24 ml-auto"
+                        />
+                      ) : (
+                        r.score
+                      )}
+                    </TableCell>
+                    {isFaculty && (
+                      <TableCell className="text-right">
+                        {editing ? (
+                          <div className="flex justify-end gap-2">
+                            <Button size="sm" variant="secondary" onClick={() => { setRowEditKey(null); setRowEditScore(''); }}>Cancel</Button>
+                            <Button size="sm" onClick={async () => {
+                              try {
+                                const val = rowEditScore === '' ? '' : Number(rowEditScore);
+                                if (val === '') return; // ignore empty
+                                const payload = {
+                                  student_id: r.student_id,
+                                  course_id: r.course_id,
+                                  faculty_id: user.id,
+                                  score: Number(val),
+                                  exam_type: examLabel,
+                                };
+                                const resp = await fetch(`${API_URL}/scores`, {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify(payload)
+                                });
+                                if (!resp.ok) {
+                                  const j = await resp.json().catch(() => ({}));
+                                  throw new Error(j.message || 'Failed to update score');
+                                }
+                                setScores(prev => prev.map(x =>
+                                  ( (x.student_id === r.student_id) && (x.course_id === r.course_id) && ((x.exam_type || x.assessment || 'internal') === examLabel) )
+                                    ? { ...x, score: Number(val), exam_type: examLabel }
+                                    : x
+                                ));
+                                setRowEditKey(null);
+                                setRowEditScore('');
+                              } catch (e) {
+                                alert(e.message);
+                              }
+                            }}>Save</Button>
+                          </div>
+                        ) : (
+                          <Button size="sm" variant="outline" onClick={() => { setRowEditKey(key); setRowEditScore(r.score ?? ''); }}>Edit</Button>
+                        )}
+                      </TableCell>
+                    )}
+                  </TableRow>
+                );
+              })}
               {scores.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={5} className="text-center h-24 text-gray-500 dark:text-gray-400">No scores yet.</TableCell>
+                  <TableCell colSpan={isFaculty ? 6 : 5} className="text-center h-24 text-gray-500 dark:text-gray-400">No scores yet.</TableCell>
                 </TableRow>
               )}
             </TableBody>
@@ -1306,107 +1990,216 @@ function ScoresPage({ user }) {
 
 function AttendancePage({ user }) {
   const isFaculty = user.role === 'faculty';
+  const { students, courses } = React.useContext(DataContext);
   const [searchTerm, setSearchTerm] = useState('');
-  const [selectedCourse, setSelectedCourse] = useState('all');
-  
-  // TODO: Fetch attendance data from API
-  const [attendance, setAttendance] = useState(mockAttendance);
+  const [selectedDeptName, setSelectedDeptName] = useState('all');
+  const [selectedCourseId, setSelectedCourseId] = useState(courses[0]?.id || '');
+  const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().slice(0,10));
+  const [isLoading, setIsLoading] = useState(false);
+  const [attendanceMap, setAttendanceMap] = useState({}); // { student_id: 'Present'|'Absent' }
+  const [changedIds, setChangedIds] = useState(new Set());
+  const [attPage, setAttPage] = useState(1);
+  const [attPageSize, setAttPageSize] = useState(10);
 
+  const filteredStudents = useMemo(() => {
+    const q = searchTerm.trim().toLowerCase();
+    const byDept = selectedDeptName === 'all' ? students : students.filter(s => s.department === selectedDeptName);
+    if (!q) return byDept;
+    return byDept.filter(s =>
+      (s.name || '').toLowerCase().includes(q) ||
+      (s.email || '').toLowerCase().includes(q) ||
+      String(s.student_id || s.id).toLowerCase().includes(q)
+    );
+  }, [students, searchTerm, selectedDeptName]);
 
-  const filteredAttendance = useMemo(() => {
-    return attendance.filter(att => {
-      const nameMatch = att.studentName.toLowerCase().includes(searchTerm.toLowerCase());
-      const courseMatch = selectedCourse === 'all' || att.course === selectedCourse;
-      return nameMatch && courseMatch;
-    });
-  }, [attendance, searchTerm, selectedCourse]);
+  const totalAttPages = Math.max(1, Math.ceil(filteredStudents.length / attPageSize));
+  const paginatedStudents = useMemo(() => {
+    const start = (attPage - 1) * attPageSize;
+    return filteredStudents.slice(start, start + attPageSize);
+  }, [filteredStudents, attPage, attPageSize]);
 
-  const courseOptions = useMemo(() => {
-    return ['all', ...new Set(attendance.map(a => a.course))];
-  }, [attendance]);
+  useEffect(() => { setAttPage(1); }, [searchTerm]);
+  useEffect(() => { setAttPage(1); }, [selectedCourseId, selectedDate, selectedDeptName]);
+  useEffect(() => {
+    if (!selectedCourseId && courses[0]?.id) setSelectedCourseId(courses[0].id);
+  }, [courses]);
+
+  // Helper to get dept id from name
+  const selectedDeptId = useMemo(() => {
+    if (selectedDeptName === 'all') return null;
+    const d = mockDepartments.find(d => d.name === selectedDeptName);
+    return d ? d.id : null;
+  }, [selectedDeptName]);
+
+  // When department changes, ensure selected course belongs to that dept; else reset to first
+  useEffect(() => {
+    if (!selectedDeptId) return; // 'all' - allow any
+    const inDept = courses.filter(c => c.dept_id === selectedDeptId);
+    if (inDept.length === 0) {
+      setSelectedCourseId('');
+    } else if (!inDept.some(c => c.id === selectedCourseId)) {
+      setSelectedCourseId(inDept[0].id);
+    }
+  }, [selectedDeptId, courses]);
+
+  const loadExisting = async () => {
+    if (!selectedCourseId || !selectedDate) return;
+    setIsLoading(true);
+    try {
+      const params = new URLSearchParams({ course_id: String(selectedCourseId), date: selectedDate });
+      const res = await fetch(`${API_URL}/attendance?${params.toString()}`);
+      const data = await res.json().catch(() => []);
+      const map = {};
+      if (Array.isArray(data)) {
+        for (const r of data) {
+          if (r.student_id) map[r.student_id] = r.status || 'Absent';
+        }
+      }
+      setAttendanceMap(map);
+      setChangedIds(new Set());
+    } catch (_) {
+      // ignore
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const setStatus = (sid, status) => {
+    setAttendanceMap(prev => ({ ...prev, [sid]: status }));
+    setChangedIds(prev => new Set(prev).add(sid));
+  };
+
+  const saveAll = async () => {
+    if (!selectedCourseId || !selectedDate) return alert('Select course and date');
+    setIsLoading(true);
+    try {
+      const toSave = Array.from(changedIds);
+      for (const sid of toSave) {
+        const status = attendanceMap[sid] || 'Absent';
+        const payload = { student_id: sid, course_id: selectedCourseId, date: selectedDate, status };
+        const res = await fetch(`${API_URL}/attendance`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(() => ({}));
+          throw new Error(j.message || `Failed to save attendance for ${sid}`);
+        }
+      }
+      setChangedIds(new Set());
+      alert('Attendance saved');
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // courseOptions not needed; course list is derived from DataContext and filtered by department
 
   return (
     <div className="space-y-6">
       <h1 className="text-3xl font-bold dark:text-white">Attendance</h1>
       
-      {isFaculty && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Search & Filter</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col md:flex-row gap-4">
-            <Input
-              icon={Search}
-              placeholder="Search by student name..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="md:w-1/2"
-            />
-            <Select
-              value={selectedCourse}
-              onChange={(e) => setSelectedCourse(e.target.value)}
-              className="md:w-1/2"
-            >
-              {courseOptions.map(course => (
-                <SelectItem key={course} value={course}>
-                  {course === 'all' ? 'All Courses' : course}
-                </SelectItem>
-              ))}
-            </Select>
-          </CardContent>
-        </Card>
-      )}
+      <Card>
+        <CardHeader>
+          <CardTitle>Attendance Entry</CardTitle>
+          <CardDescription>Select a course and date, then mark Present/Absent for each student.</CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <div className="space-y-1">
+              <Label>Department</Label>
+              <Select value={selectedDeptName} onChange={(e) => setSelectedDeptName(e.target.value)}>
+                <SelectItem value="all">All Departments</SelectItem>
+                {mockDepartments.map(d => (
+                  <SelectItem key={d.id} value={d.name}>{d.name}</SelectItem>
+                ))}
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>Course</Label>
+              <Select value={selectedCourseId} onChange={(e) => setSelectedCourseId(e.target.value)}>
+                {courses.length === 0 ? (
+                  <SelectItem value="">No courses</SelectItem>
+                ) : (
+                  (selectedDeptId ? courses.filter(c => c.dept_id === selectedDeptId) : courses).map(c => (
+                    <SelectItem key={c.id} value={c.id}>{c.title}</SelectItem>
+                  ))
+                )}
+              </Select>
+            </div>
+            <div className="space-y-1">
+              <Label>Date</Label>
+              <Input type="date" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)} />
+            </div>
+            <div className="space-y-1 md:col-span-2 flex items-end gap-2">
+              <Input icon={Search} placeholder="Search students..." value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+              <Button variant="secondary" onClick={loadExisting} isLoading={isLoading}>Load</Button>
+              <Button onClick={saveAll} isLoading={isLoading}>Save All</Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Attendance Record</CardTitle>
-          <CardDescription>
-            {isFaculty ? "Manage attendance for your sections." : "Your attendance for the current term."}
-          </CardDescription>
+          <CardTitle>Mark Attendance</CardTitle>
+          <CardDescription>All students listed. Use the selector to mark status.</CardDescription>
         </CardHeader>
         <CardContent className="p-0">
           <Table>
             <TableHeader>
               <TableRow>
-                <TableHead>Date</TableHead>
-                {isFaculty && <TableHead>Student</TableHead>}
-                <TableHead>Course</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Remarks</TableHead>
+                <TableHead>Student</TableHead>
+                <TableHead>Email</TableHead>
+                <TableHead className="text-right">Status</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filteredAttendance.map((att) => (
-                <TableRow key={att.id}>
-                  <TableCell>{att.date}</TableCell>
-                  {isFaculty && <TableCell>{att.studentName} ({att.studentId})</TableCell>}
-                  <TableCell>{att.course}</TableCell>
-                  <TableCell>
-                    <span
-                      className={cn(
-                        'px-2 py-0.5 rounded-full text-xs font-medium',
-                        att.status === 'Present'
-                          ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200'
-                          : 'bg-rose-100 text-rose-800 dark:bg-rose-900 dark:text-rose-200'
-                      )}
-                    >
-                      {att.status}
-                    </span>
-                  </TableCell>
-                  <TableCell>{att.remarks}</TableCell>
-                </TableRow>
-              ))}
-              {filteredAttendance.length === 0 && (
+              {paginatedStudents.map(s => {
+                const sid = s.student_id || s.id;
+                const val = attendanceMap[sid] || 'Absent';
+                return (
+                  <TableRow key={sid}>
+                    <TableCell>{s.name} <span className="text-xs text-gray-500">({sid})</span></TableCell>
+                    <TableCell>{s.email}</TableCell>
+                    <TableCell className="text-right">
+                      <Select value={val} onChange={(e) => setStatus(sid, e.target.value)} className="w-32 ml-auto">
+                        <SelectItem value="Present">Present</SelectItem>
+                        <SelectItem value="Absent">Absent</SelectItem>
+                      </Select>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+              {filteredStudents.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={isFaculty ? 5 : 4} className="text-center h-24 text-gray-500 dark:text-gray-400">
-                    No records found.
-                  </TableCell>
+                  <TableCell colSpan={3} className="text-center h-24 text-gray-500 dark:text-gray-400">No students found.</TableCell>
                 </TableRow>
               )}
             </TableBody>
           </Table>
         </CardContent>
       </Card>
+
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-sm text-gray-600 dark:text-gray-400">
+          Showing {paginatedStudents.length} of {filteredStudents.length}
+        </div>
+        <div className="flex items-center gap-2">
+          <Label className="mr-2">Rows</Label>
+          <Select value={attPageSize} onChange={(e) => { setAttPageSize(Number(e.target.value)); setAttPage(1); }}>
+            {[5,10,20,50].map(sz => (
+              <SelectItem key={sz} value={sz}>{sz}</SelectItem>
+            ))}
+          </Select>
+          <Button variant="outline" size="sm" onClick={() => setAttPage(p => Math.max(1, p - 1))} disabled={attPage <= 1}>Prev</Button>
+          <div className="text-sm dark:text-gray-200">Page {attPage} / {totalAttPages}</div>
+          <Button variant="outline" size="sm" onClick={() => setAttPage(p => Math.min(totalAttPages, p + 1))} disabled={attPage >= totalAttPages}>Next</Button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1416,6 +2209,8 @@ function StudentManagementPage({ user, setNotification }) {
   const { apiAvailable } = React.useContext(DataContext);
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedDept, setSelectedDept] = useState('all');
+  const [studentPage, setStudentPage] = useState(1);
+  const [studentPageSize, setStudentPageSize] = useState(10);
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [newStudent, setNewStudent] = useState({
@@ -1440,6 +2235,16 @@ function StudentManagementPage({ user, setNotification }) {
       return (nameMatch || emailMatch || idMatch) && deptMatch;
     });
   }, [students, searchTerm, selectedDept]);
+
+  const totalStudentPages = Math.max(1, Math.ceil(filteredStudents.length / studentPageSize));
+  const paginatedStudents = useMemo(() => {
+    const start = (studentPage - 1) * studentPageSize;
+    return filteredStudents.slice(start, start + studentPageSize);
+  }, [filteredStudents, studentPage, studentPageSize]);
+
+  useEffect(() => {
+    setStudentPage(1);
+  }, [searchTerm, selectedDept]);
 
   const handleAddNewStudent = (e) => {
     e.preventDefault();
@@ -1794,7 +2599,7 @@ function StudentManagementPage({ user, setNotification }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filteredStudents.map((student) => (
+              {paginatedStudents.map((student) => (
                 <TableRow key={student.backend_id || student.student_id || student.id}>
                   <TableCell className="font-medium">{student.student_id || student.id}</TableCell>
                   <TableCell>{student.name}</TableCell>
@@ -1837,6 +2642,23 @@ function StudentManagementPage({ user, setNotification }) {
           </Table>
         </CardContent>
       </Card>
+
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-sm text-gray-600 dark:text-gray-400">
+          Showing {paginatedStudents.length} of {filteredStudents.length}
+        </div>
+        <div className="flex items-center gap-2">
+          <Label className="mr-2">Rows</Label>
+          <Select value={studentPageSize} onChange={(e) => { setStudentPageSize(Number(e.target.value)); setStudentPage(1); }}>
+            {[5,10,20,50].map(sz => (
+              <SelectItem key={sz} value={sz}>{sz}</SelectItem>
+            ))}
+          </Select>
+          <Button variant="outline" size="sm" onClick={() => setStudentPage(p => Math.max(1, p - 1))} disabled={studentPage <= 1}>Prev</Button>
+          <div className="text-sm dark:text-gray-200">Page {studentPage} / {totalStudentPages}</div>
+          <Button variant="outline" size="sm" onClick={() => setStudentPage(p => Math.min(totalStudentPages, p + 1))} disabled={studentPage >= totalStudentPages}>Next</Button>
+        </div>
+      </div>
       
       {/* Add Student modal is rendered inline above (to avoid duplicate/old forms). */}
     </div>
@@ -1847,10 +2669,12 @@ function StudentManagementPage({ user, setNotification }) {
  * FacultyManagementPage
  * New page for Admins to add faculty
  */
-function FacultyManagementPage({ user, setNotification }) {
-  const { faculty, setFaculty, courses } = React.useContext(DataContext);
+function FacultyManagementPage({ user, setNotification, setPage }) {
+  const { faculty, setFaculty, courses, setSelectedFacultyIdForTimetable } = React.useContext(DataContext);
   const [isAddFacultyModalOpen, setIsAddFacultyModalOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [facPage, setFacPage] = useState(1);
+  const [facPageSize, setFacPageSize] = useState(10);
   const [newFaculty, setNewFaculty] = useState({
       id: '', name: '', email: '', department: mockDepartments[0].name, designation: 'Assistant Professor', courses: ''
   });
@@ -1890,9 +2714,38 @@ function FacultyManagementPage({ user, setNotification }) {
     }
   };
 
-  const handleDeleteFaculty = (id) => {
-    // This is disabled because the DELETE /api/faculty/:id endpoint is not in server.js
-    setNotification({ type: 'info', message: 'Delete Faculty endpoint not implemented in backend.' });
+  const handleDeleteFaculty = async (id) => {
+    if (!confirm('Delete this faculty? This action is permanent.')) return;
+    setIsLoading(true);
+    try {
+      let res = await fetch(`${API_URL}/faculty/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!(res.ok || res.status === 204)) {
+        let msg = '';
+        try { const j = await res.json(); msg = j.message || ''; } catch (_) {}
+        // If related records block deletion, ask to cascade and retry
+        if (res.status === 409 && /related\s+records/i.test(msg)) {
+          const doCascade = confirm('This faculty has related records (scores/sections). Delete them as well?');
+          if (doCascade) {
+            res = await fetch(`${API_URL}/faculty/${encodeURIComponent(id)}?cascade=true`, { method: 'DELETE' });
+            if (!(res.ok || res.status === 204)) {
+              let msg2 = '';
+              try { const j2 = await res.json(); msg2 = j2.message || ''; } catch (_) {}
+              throw new Error(msg2 || `Failed to delete faculty (${res.status}).`);
+            }
+          } else {
+            throw new Error(msg || 'Delete cancelled.');
+          }
+        } else {
+          throw new Error(msg || `Failed to delete faculty (${res.status}).`);
+        }
+      }
+      setFaculty(prev => prev.filter(f => f.id !== id));
+      setNotification({ type: 'success', message: 'Faculty deleted.' });
+    } catch (error) {
+      setNotification({ type: 'error', message: error.message });
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleFacultyFormChange = (e) => {
@@ -1928,7 +2781,7 @@ function FacultyManagementPage({ user, setNotification }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {faculty.map((faculty) => (
+              {faculty.slice((facPage-1)*facPageSize, (facPage-1)*facPageSize + facPageSize).map((faculty) => (
                 <TableRow key={faculty.id}>
                   <TableCell className="font-medium">{faculty.id}</TableCell>
                   <TableCell>{faculty.name}</TableCell>
@@ -1938,11 +2791,20 @@ function FacultyManagementPage({ user, setNotification }) {
                   <TableCell>{faculty.courses.join(', ')}</TableCell>
                   <TableCell className="flex gap-2">
                     <Button 
+                      variant="outline" 
+                      size="sm"
+                      onClick={() => {
+                        setSelectedFacultyIdForTimetable(faculty.id);
+                        setPage && setPage('timetable');
+                      }}
+                    >
+                      View Timetable
+                    </Button>
+                    <Button 
                       variant="destructive" 
                       size="sm"
                       onClick={() => handleDeleteFaculty(faculty.id)}
-                      disabled // TODO: Remove 'disabled' when DELETE /api/faculty/:id endpoint is created
-                      title="Delete Faculty endpoint not implemented in server.js"
+                      disabled={isLoading}
                     >
                       Delete
                     </Button>
@@ -1960,6 +2822,23 @@ function FacultyManagementPage({ user, setNotification }) {
           </Table>
         </CardContent>
       </Card>
+
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-sm text-gray-600 dark:text-gray-400">
+          Showing {Math.min(faculty.length - (facPage-1)*facPageSize, facPageSize)} of {faculty.length}
+        </div>
+        <div className="flex items-center gap-2">
+          <Label className="mr-2">Rows</Label>
+          <Select value={facPageSize} onChange={(e) => { setFacPageSize(Number(e.target.value)); setFacPage(1); }}>
+            {[5,10,20,50].map(sz => (
+              <SelectItem key={sz} value={sz}>{sz}</SelectItem>
+            ))}
+          </Select>
+          <Button variant="outline" size="sm" onClick={() => setFacPage(p => Math.max(1, p - 1))} disabled={facPage <= 1}>Prev</Button>
+          <div className="text-sm dark:text-gray-200">Page {facPage} / {Math.max(1, Math.ceil(faculty.length / facPageSize))}</div>
+          <Button variant="outline" size="sm" onClick={() => setFacPage(p => Math.min(Math.max(1, Math.ceil(faculty.length / facPageSize)), p + 1))} disabled={facPage >= Math.max(1, Math.ceil(faculty.length / facPageSize))}>Next</Button>
+        </div>
+      </div>
 
       {/* Add Faculty Modal */}
        <Modal 
@@ -2096,6 +2975,41 @@ function Notification({ notification, onDismiss }) {
         </motion.div>
       )}
     </AnimatePresence>
+  );
+}
+
+// NotificationPanel: dropdown panel that opens when clicking the bell icon
+function NotificationPanel({ isOpen, onClose, notifications = [], onMarkAllRead, onClear, onToggleRead }) {
+  if (!isOpen) return null;
+  return (
+    <div className="fixed top-16 right-4 z-[10000] w-80 max-h-[70vh] overflow-hidden rounded-xl border border-gray-200 bg-white shadow-2xl dark:border-gray-800 dark:bg-gray-950">
+      <div className="flex items-center justify-between px-4 py-3 border-b dark:border-gray-800">
+        <div className="font-semibold dark:text-white">Notifications</div>
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={onMarkAllRead}>Mark all read</Button>
+          <Button variant="ghost" size="sm" onClick={onClear}>Clear</Button>
+          <Button variant="ghost" size="icon" onClick={onClose}><X className="h-4 w-4" /></Button>
+        </div>
+      </div>
+      <div className="max-h-[60vh] overflow-y-auto">
+        {notifications.length === 0 ? (
+          <div className="p-4 text-sm text-gray-500 dark:text-gray-400">No notifications</div>
+        ) : (
+          notifications.map(n => (
+            <div key={n.id} className={cn("px-4 py-3 border-b last:border-b-0 dark:border-gray-800 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-900", !n.read && "bg-indigo-50/60 dark:bg-indigo-900/20")}
+                 onClick={() => onToggleRead && onToggleRead(n.id)}>
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <div className={cn("text-sm font-medium", n.read ? "text-gray-700 dark:text-gray-300" : "text-indigo-700 dark:text-indigo-300")}>{n.title}</div>
+                  {n.message && <div className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">{n.message}</div>}
+                </div>
+                <div className="text-[11px] text-gray-500 dark:text-gray-400 whitespace-nowrap">{n.time || ''}</div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
   );
 }
 
