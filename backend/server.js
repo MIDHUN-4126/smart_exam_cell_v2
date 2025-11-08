@@ -397,22 +397,98 @@ app.delete('/api/faculty/:id', async (req, res) => {
 });
 
 app.get('/api/courses', async (req, res) => {
-     try {
-        const [rows] = await pool.query(`
+    const { student_id } = req.query;
+    
+    try {
+        let sql = `
             SELECT 
                 c.course_id as id, 
                 c.title, 
                 c.credits, 
                 c.dept_id 
             FROM course c
-            ORDER BY c.course_id ASC
-        `);
-         // Add dummy faculty/grade for now
+        `;
+        
+        const params = [];
+        
+        // If student_id is provided, filter courses by student's department
+        if (student_id) {
+            sql = `
+                SELECT 
+                    c.course_id as id, 
+                    c.title, 
+                    c.credits, 
+                    c.dept_id,
+                    d.name as dept_name
+                FROM course c
+                LEFT JOIN department d ON c.dept_id = d.dept_id
+                WHERE c.dept_id = (
+                    SELECT p.dept_id 
+                    FROM student s
+                    JOIN program p ON s.program_id = p.program_id
+                    WHERE s.student_id = ?
+                )
+            `;
+            params.push(student_id);
+        }
+        
+        sql += ' ORDER BY c.course_id ASC';
+        
+        const [rows] = await pool.query(sql, params);
+        
+        // Add dummy faculty/grade for now
         const coursesWithExtras = rows.map(c => ({ ...c, faculty: 'Unassigned', grade: null })); 
         res.json(coursesWithExtras);
     } catch (error) {
         console.error("Error fetching courses:", error);
         res.status(500).json({ message: "Failed to fetch courses." });
+    }
+});
+
+// GET /api/enrollments?student_id=
+// Returns enrolled courses for a student by joining enrollment -> section -> course when necessary.
+app.get('/api/enrollments', async (req, res) => {
+    const { student_id } = req.query;
+    if (!student_id) return res.status(400).json({ message: 'student_id is required' });
+    let conn;
+    try {
+        conn = await pool.getConnection();
+        // Detect enrollment table and its columns
+        const [tbl] = await conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'enrollment'`);
+        if (tbl.length === 0) return res.json([]);
+        const [enCols] = await conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'enrollment'`);
+        const enNames = new Set(enCols.map(r => r.COLUMN_NAME));
+
+        // If enrollment has course_id directly, use it. Otherwise join section -> course.
+        if (enNames.has('course_id')) {
+            const sql = `SELECT e.*, c.course_id AS course_id, c.title AS course_title FROM enrollment e LEFT JOIN course c ON c.course_id = e.course_id WHERE e.student_id = ?`;
+            const [rows] = await conn.query(sql, [student_id]);
+            const normalized = rows.map(r => ({ enrollment_id: r.enrollment_id, student_id: r.student_id, course_id: r.course_id, course_title: r.course_title }));
+            return res.json(normalized);
+        }
+
+        // Fallback: expect enrollment has section_id which maps to section.section_id -> course.course_id
+        const [secCols] = await conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'section'`);
+        const secNames = new Set(secCols.map(r => r.COLUMN_NAME));
+        if (!enNames.has('section_id') || !secNames.has('section_id')) {
+            // unknown enrollment shape
+            return res.json([]);
+        }
+
+        const sql = `
+            SELECT e.enrollment_id, e.student_id, s.section_id, s.course_id, c.title AS course_title
+            FROM enrollment e
+            LEFT JOIN section s ON s.section_id = e.section_id
+            LEFT JOIN course c ON c.course_id = s.course_id
+            WHERE e.student_id = ?`;
+        const [rows] = await conn.query(sql, [student_id]);
+        const normalized = rows.map(r => ({ enrollment_id: r.enrollment_id, student_id: r.student_id, course_id: r.course_id, course_title: r.course_title }));
+        return res.json(normalized);
+    } catch (error) {
+        console.error('Error fetching enrollments:', error);
+        return res.json([]);
+    } finally {
+        if (conn) conn.release();
     }
 });
 
@@ -853,12 +929,15 @@ async function getAttendanceColumns(conn) {
         `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'attendance'`
     );
     const names = new Set(cols.map(c => c.COLUMN_NAME));
-    const dateCol = names.has('date') ? 'date' : (names.has('att_date') ? 'att_date' : (names.has('attendance_date') ? 'attendance_date' : null));
+    // Detect date column variants
+    const dateCol = names.has('class_date') ? 'class_date' : (names.has('date') ? 'date' : (names.has('att_date') ? 'att_date' : (names.has('attendance_date') ? 'attendance_date' : null)));
     const statusCol = names.has('status') ? 'status' : null;
     const remarksCol = names.has('remarks') ? 'remarks' : (names.has('note') ? 'note' : null);
     const studentCol = names.has('student_id') ? 'student_id' : null;
+    // Check for course_id or section_id
     const courseCol = names.has('course_id') ? 'course_id' : null;
-    return { dateCol, statusCol, remarksCol, studentCol, courseCol, hasTable: cols.length > 0 };
+    const sectionCol = names.has('section_id') ? 'section_id' : null;
+    return { dateCol, statusCol, remarksCol, studentCol, courseCol, sectionCol, hasTable: cols.length > 0 };
 }
 
 // GET /api/attendance?student_id=&course_id=&date=
@@ -866,33 +945,62 @@ app.get('/api/attendance', async (req, res) => {
     let conn;
     try {
         conn = await pool.getConnection();
-        const { dateCol, statusCol, remarksCol, studentCol, courseCol, hasTable } = await getAttendanceColumns(conn);
-        if (!hasTable || !dateCol || !statusCol || !studentCol || !courseCol) {
+        const { dateCol, statusCol, remarksCol, studentCol, courseCol, sectionCol, hasTable } = await getAttendanceColumns(conn);
+        if (!hasTable || !dateCol || !statusCol || !studentCol) {
             return res.json([]); // Graceful empty if table or required cols missing
         }
 
         const { student_id, course_id, date } = req.query;
         const where = [];
         const params = [];
+        
         if (student_id) { where.push(`a.\`${studentCol}\` = ?`); params.push(student_id); }
-        if (course_id) { where.push(`a.\`${courseCol}\` = ?`); params.push(course_id); }
         if (date) { where.push(`a.\`${dateCol}\` = ?`); params.push(date); }
-
-        const sql = `
-            SELECT 
-                a.\`${studentCol}\` AS student_id,
-                a.\`${courseCol}\` AS course_id,
-                a.\`${dateCol}\` AS date,
-                a.\`${statusCol}\` AS status,
-                ${remarksCol ? `a.\`${remarksCol}\` AS remarks,` : `NULL AS remarks,`}
-                CONCAT(s.first_name, ' ', s.last_name) AS student_name,
-                s.email AS student_email,
-                c.title AS course_title
-            FROM attendance a
-            LEFT JOIN student s ON s.student_id = a.\`${studentCol}\`
-            LEFT JOIN course c ON c.course_id = a.\`${courseCol}\`
-            ${where.length ? ('WHERE ' + where.join(' AND ')) : ''}
-            ORDER BY a.\`${dateCol}\` DESC, a.\`${studentCol}\` ASC`;
+        
+        // Build SQL based on whether attendance has course_id or section_id
+        let sql;
+        if (courseCol) {
+            // Direct course_id in attendance table
+            if (course_id) { where.push(`a.\`${courseCol}\` = ?`); params.push(course_id); }
+            sql = `
+                SELECT 
+                    a.\`${studentCol}\` AS student_id,
+                    a.\`${courseCol}\` AS course_id,
+                    a.\`${dateCol}\` AS date,
+                    a.\`${statusCol}\` AS status,
+                    ${remarksCol ? `a.\`${remarksCol}\` AS remarks,` : `NULL AS remarks,`}
+                    CONCAT(s.first_name, ' ', s.last_name) AS student_name,
+                    s.email AS student_email,
+                    c.title AS course_title
+                FROM attendance a
+                LEFT JOIN student s ON s.student_id = a.\`${studentCol}\`
+                LEFT JOIN course c ON c.course_id = a.\`${courseCol}\`
+                ${where.length ? ('WHERE ' + where.join(' AND ')) : ''}
+                ORDER BY a.\`${dateCol}\` DESC, a.\`${studentCol}\` ASC`;
+        } else if (sectionCol) {
+            // Attendance has section_id; join through section to get course
+            if (course_id) { where.push(`sec.course_id = ?`); params.push(course_id); }
+            sql = `
+                SELECT 
+                    a.\`${studentCol}\` AS student_id,
+                    sec.course_id AS course_id,
+                    a.\`${dateCol}\` AS date,
+                    a.\`${statusCol}\` AS status,
+                    ${remarksCol ? `a.\`${remarksCol}\` AS remarks,` : `NULL AS remarks,`}
+                    CONCAT(st.first_name, ' ', st.last_name) AS student_name,
+                    st.email AS student_email,
+                    c.title AS course_title
+                FROM attendance a
+                LEFT JOIN student st ON st.student_id = a.\`${studentCol}\`
+                LEFT JOIN section sec ON sec.section_id = a.\`${sectionCol}\`
+                LEFT JOIN course c ON c.course_id = sec.course_id
+                ${where.length ? ('WHERE ' + where.join(' AND ')) : ''}
+                ORDER BY a.\`${dateCol}\` DESC, a.\`${studentCol}\` ASC`;
+        } else {
+            // No course or section reference
+            return res.json([]);
+        }
+        
         const [rows] = await conn.query(sql, params);
         return res.json(rows);
     } catch (error) {
@@ -966,6 +1074,377 @@ app.post('/api/attendance', async (req, res) => {
         return res.status(500).json({ message: 'Failed to save attendance.' });
     } finally {
         if (conn) conn.release();
+    }
+});
+
+// 9. Exams endpoints
+// Exposes exam schedule information. Table name (optional) expected: `exam_schedule`
+// Expected columns (detected dynamically):
+//  - exam_id (PK), title, exam_date/date, start_time, end_time, course_id, hall/exam_hall, faculty_id, paper/code
+// GET /api/exams?student_id=&faculty_id=&course_id=&date=
+app.get('/api/exams', async (req, res) => {
+    let conn;
+    try {
+        conn = await pool.getConnection();
+
+        // Check if exam_schedule table exists
+        const [tbl] = await conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'exam_schedule'`);
+        if (tbl.length === 0) return res.json([]);
+
+        // Inspect columns
+        const [cols] = await conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'exam_schedule'`);
+        const names = new Set(cols.map(c => c.COLUMN_NAME));
+
+        const idCol = names.has('exam_id') ? 'exam_id' : (names.has('id') ? 'id' : null);
+        const titleCol = names.has('title') ? 'title' : (names.has('exam_name') ? 'exam_name' : null);
+        const dateCol = names.has('exam_date') ? 'exam_date' : (names.has('date') ? 'date' : null);
+        const startCol = names.has('start_time') ? 'start_time' : null;
+        const endCol = names.has('end_time') ? 'end_time' : null;
+        const courseCol = names.has('course_id') ? 'course_id' : null;
+        const hallCol = names.has('hall') ? 'hall' : (names.has('exam_hall') ? 'exam_hall' : null);
+        const facultyCol = names.has('faculty_id') ? 'faculty_id' : null;
+        const paperCol = names.has('paper') ? 'paper' : (names.has('paper_code') ? 'paper_code' : null);
+
+        // Server-side enforcement: prefer explicit auth headers when present.
+        // Frontend should pass X-User-Id and X-User-Role when available.
+        const headerUserId = String(req.get('x-user-id') || '').trim() || null;
+        const headerUserRole = String(req.get('x-user-role') || '').trim() || null;
+
+        // Start from query, but may be overridden below
+        const q = req.query || {};
+        let { student_id, faculty_id, course_id, date } = q;
+        // If the client provided auth headers, enforce scope server-side
+        if (headerUserId && headerUserRole) {
+            if (headerUserRole === 'student') {
+                // Force student scope
+                student_id = headerUserId;
+            } else if (headerUserRole === 'faculty') {
+                // Force faculty scope
+                faculty_id = headerUserId;
+            }
+        }
+        const where = [];
+        const params = [];
+        let extraJoin = '';
+
+        // If exam_schedule has an explicit student_id column, filter directly.
+        // Otherwise, try to limit exams to the student's enrolled courses using the enrollment table.
+    if (student_id) {
+            if (names.has('student_id')) {
+                where.push(`\`student_id\` = ?`); params.push(student_id);
+            } else {
+                // Try to detect enrollment table and course relationship
+                if (courseCol) {
+                    const [enTbl] = await conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'enrollment'`);
+                    if (enTbl.length > 0) {
+                        // Ensure enrollment has course_id and student_id
+                        const [enCols] = await conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'enrollment'`);
+                        const enNames = new Set(enCols.map(c => c.COLUMN_NAME));
+                        if (enNames.has('course_id') && enNames.has('student_id')) {
+                            extraJoin += ` JOIN enrollment e ON e.course_id = s.\`${courseCol}\``;
+                            where.push('e.student_id = ?'); params.push(student_id);
+                        }
+                    }
+                }
+            }
+        }
+        if (faculty_id && facultyCol) { where.push(`\`${facultyCol}\` = ?`); params.push(faculty_id); }
+        if (course_id && courseCol) { where.push(`\`${courseCol}\` = ?`); params.push(course_id); }
+        if (date && dateCol) { where.push(`\`${dateCol}\` = ?`); params.push(date); }
+
+        // Build select list with safe aliases
+        const selectCols = [];
+        if (idCol) selectCols.push(`s.\`${idCol}\` AS exam_id`);
+        if (titleCol) selectCols.push(`s.\`${titleCol}\` AS title`);
+        if (dateCol) selectCols.push(`s.\`${dateCol}\` AS date`);
+        if (startCol) selectCols.push(`s.\`${startCol}\` AS start_time`);
+        if (endCol) selectCols.push(`s.\`${endCol}\` AS end_time`);
+        if (hallCol) selectCols.push(`s.\`${hallCol}\` AS hall`);
+        if (paperCol) selectCols.push(`s.\`${paperCol}\` AS paper`);
+        if (courseCol) selectCols.push(`s.\`${courseCol}\` AS course_id`);
+        if (facultyCol) selectCols.push(`s.\`${facultyCol}\` AS faculty_id`);
+
+        // Join with course and faculty for readable fields when available
+        let joins = '';
+        if (courseCol) joins += ' LEFT JOIN course c ON c.course_id = s.`' + courseCol + '`';
+        if (facultyCol) joins += ' LEFT JOIN faculty f ON f.faculty_id = s.`' + facultyCol + '`';
+        if (selectCols.length === 0) selectCols.push('s.*');
+
+    const sql = `SELECT ${selectCols.join(', ')}, ${courseCol ? 'c.title AS course_title,' : ''} ${facultyCol ? "CONCAT(f.first_name,' ',f.last_name) AS faculty_name" : 'NULL AS faculty_name'} FROM exam_schedule s ${joins} ${extraJoin} ${where.length ? ('WHERE ' + where.join(' AND ')) : ''} ORDER BY ${dateCol ? ('s.`' + dateCol + '` DESC') : 's.`' + (idCol || 'exam_id') + '` DESC'}`;
+
+        const [rows] = await conn.query(sql, params);
+        // Normalize faculty_name when NULL
+        const normalized = rows.map(r => ({
+            exam_id: r.exam_id,
+            title: r.title,
+            date: r.date,
+            start_time: r.start_time,
+            end_time: r.end_time,
+            hall: r.hall,
+            paper: r.paper,
+            course_id: r.course_id,
+            course_title: r.course_title || null,
+            faculty_id: r.faculty_id,
+            faculty_name: r.faculty_name || null,
+        }));
+
+        return res.json(normalized);
+    } catch (error) {
+        console.error('Error fetching exams:', error);
+        return res.json([]);
+    } finally {
+        if (conn) conn.release();
+    }
+});
+
+// ===== EXAM MANAGEMENT ENDPOINTS =====
+
+// Create a new exam with hall and teacher assignments
+app.post('/api/exams', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const { title, exam_date, start_time, end_time, course_id, section_id, hall, exam_type, teacher_assignments } = req.body;
+        
+        // Insert main exam record
+        const [result] = await conn.query(
+            `INSERT INTO exam_schedule (title, exam_date, start_time, end_time, course_id, section_id, hall, exam_type) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [title, exam_date, start_time, end_time, course_id, section_id, hall, exam_type || 'Regular']
+        );
+        
+        const examId = result.insertId;
+        
+        // Insert teacher assignments if provided
+        if (teacher_assignments && Array.isArray(teacher_assignments)) {
+            for (const assignment of teacher_assignments) {
+                await conn.query(
+                    `INSERT INTO exam_teacher_assignment (exam_id, faculty_id, course_id, role_type) 
+                     VALUES (?, ?, ?, ?)`,
+                    [examId, assignment.faculty_id, assignment.course_id, assignment.role_type || 'both']
+                );
+            }
+        }
+        
+        res.json({ success: true, exam_id: examId, message: 'Exam created successfully' });
+    } catch (error) {
+        console.error('Error creating exam:', error);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Get all exams with details
+app.get('/api/exams', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const [exams] = await conn.query(`
+            SELECT 
+                es.*,
+                c.title AS course_title,
+                CONCAT(COALESCE(s.section_no, ''), ' ', COALESCE(s.term, ''), ' ', COALESCE(s.year, '')) AS section_name,
+                CONCAT(f.first_name, ' ', f.last_name) AS faculty_name
+            FROM exam_schedule es
+            LEFT JOIN course c ON es.course_id = c.course_id
+            LEFT JOIN section s ON es.section_id = s.section_id
+            LEFT JOIN faculty f ON es.faculty_id = f.faculty_id
+            ORDER BY es.exam_date DESC, es.start_time DESC
+        `);
+        
+        res.json(exams);
+    } catch (error) {
+        console.error('Error fetching exams:', error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Get exam details with all assignments
+app.get('/api/exams/:examId', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const { examId } = req.params;
+        
+        // Get exam details
+        const [exams] = await conn.query(`
+            SELECT 
+                es.*,
+                c.title AS course_title,
+                CONCAT(COALESCE(s.section_no, ''), ' ', COALESCE(s.term, ''), ' ', COALESCE(s.year, '')) AS section_name
+            FROM exam_schedule es
+            LEFT JOIN course c ON es.course_id = c.course_id
+            LEFT JOIN section s ON es.section_id = s.section_id
+            WHERE es.exam_id = ?
+        `, [examId]);
+        
+        if (exams.length === 0) {
+            return res.status(404).json({ error: 'Exam not found' });
+        }
+        
+        // Get teacher assignments
+        const [teachers] = await conn.query(`
+            SELECT 
+                eta.*,
+                CONCAT(f.first_name, ' ', f.last_name) AS faculty_name,
+                c.title AS course_title
+            FROM exam_teacher_assignment eta
+            JOIN faculty f ON eta.faculty_id = f.faculty_id
+            JOIN course c ON eta.course_id = c.course_id
+            WHERE eta.exam_id = ?
+        `, [examId]);
+        
+        res.json({ exam: exams[0], teacher_assignments: teachers });
+    } catch (error) {
+        console.error('Error fetching exam details:', error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Assign teacher to inspect/correct papers
+app.post('/api/exams/:examId/assign-teacher', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const { examId } = req.params;
+        const { faculty_id, course_id, role_type } = req.body;
+        
+        await conn.query(
+            `INSERT INTO exam_teacher_assignment (exam_id, faculty_id, course_id, role_type) 
+             VALUES (?, ?, ?, ?) 
+             ON DUPLICATE KEY UPDATE role_type = VALUES(role_type)`,
+            [examId, faculty_id, course_id, role_type || 'both']
+        );
+        
+        res.json({ success: true, message: 'Teacher assigned successfully' });
+    } catch (error) {
+        console.error('Error assigning teacher:', error);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Create/Update exam timetable for sections
+app.post('/api/exam-timetable', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const { exam_id, section_id, course_id, exam_date, start_time, end_time, hall, instructions } = req.body;
+        
+        const [result] = await conn.query(
+            `INSERT INTO exam_timetable (exam_id, section_id, course_id, exam_date, start_time, end_time, hall, instructions) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [exam_id, section_id, course_id, exam_date, start_time, end_time, hall, instructions]
+        );
+        
+        res.json({ success: true, timetable_id: result.insertId, message: 'Timetable entry created' });
+    } catch (error) {
+        console.error('Error creating timetable entry:', error);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Get exam timetable for a section
+app.get('/api/exam-timetable/section/:sectionId', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const { sectionId } = req.params;
+        
+        const [timetable] = await conn.query(`
+            SELECT 
+                et.*,
+                es.title AS exam_title,
+                c.title AS course_title,
+                CONCAT(COALESCE(s.section_no, ''), ' ', COALESCE(s.term, ''), ' ', COALESCE(s.year, '')) AS section_name
+            FROM exam_timetable et
+            JOIN exam_schedule es ON et.exam_id = es.exam_id
+            JOIN course c ON et.course_id = c.course_id
+            JOIN section s ON et.section_id = s.section_id
+            WHERE et.section_id = ?
+            ORDER BY et.exam_date, et.start_time
+        `, [sectionId]);
+        
+        res.json(timetable);
+    } catch (error) {
+        console.error('Error fetching timetable:', error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Get all exam timetables (admin view)
+app.get('/api/exam-timetable', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const [timetable] = await conn.query(`
+            SELECT 
+                et.*,
+                es.title AS exam_title,
+                c.title AS course_title,
+                CONCAT(COALESCE(s.section_no, ''), ' ', COALESCE(s.term, ''), ' ', COALESCE(s.year, '')) AS section_name
+            FROM exam_timetable et
+            JOIN exam_schedule es ON et.exam_id = es.exam_id
+            JOIN course c ON et.course_id = c.course_id
+            JOIN section s ON et.section_id = s.section_id
+            ORDER BY et.exam_date, et.start_time
+        `);
+        
+        res.json(timetable);
+    } catch (error) {
+        console.error('Error fetching timetables:', error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Delete exam
+app.delete('/api/exams/:examId', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const { examId } = req.params;
+        await conn.query('DELETE FROM exam_schedule WHERE exam_id = ?', [examId]);
+        res.json({ success: true, message: 'Exam deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting exam:', error);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
+// Get teacher's assigned exams
+app.get('/api/teacher-exams/:facultyId', async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const { facultyId } = req.params;
+        
+        const [assignments] = await conn.query(`
+            SELECT 
+                eta.*,
+                es.title AS exam_title,
+                es.exam_date,
+                es.start_time,
+                es.end_time,
+                es.hall,
+                c.title AS course_title
+            FROM exam_teacher_assignment eta
+            JOIN exam_schedule es ON eta.exam_id = es.exam_id
+            JOIN course c ON eta.course_id = c.course_id
+            WHERE eta.faculty_id = ?
+            ORDER BY es.exam_date DESC
+        `, [facultyId]);
+        
+        res.json(assignments);
+    } catch (error) {
+        console.error('Error fetching teacher exams:', error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        conn.release();
     }
 });
 

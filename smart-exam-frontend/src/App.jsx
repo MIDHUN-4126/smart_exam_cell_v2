@@ -14,6 +14,9 @@ import {
   Loader2 // Added for loading states
 } from 'lucide-react';
 
+// Import the ExamManagement component
+import ExamManagement from './components/ExamManagement';
+
 // --- CONFIGURATION ---
 
 // Define the base URL for the API. Allow overriding via Vite env var VITE_API_URL
@@ -29,6 +32,7 @@ const ROLES_CONFIG = {
       { name: "Dashboard", icon: LayoutDashboard, page: "dashboard" },
       { name: "My Courses", icon: BookUser, page: "courses" },
       { name: "My Scores", icon: ClipboardCheck, page: "scores" },
+      { name: "Exams", icon: BookCopy, page: "exams" },
       { name: "Attendance", icon: CalendarCheck, page: "attendance" },
     ]
   },
@@ -40,6 +44,7 @@ const ROLES_CONFIG = {
       { name: "My Sections", icon: BookUser, page: "sections" },
       { name: "Students", icon: Users, page: "students" },
       { name: "Grade Entry", icon: ClipboardCheck, page: "grades" },
+      { name: "Exams", icon: BookCopy, page: "exams" },
       { name: "Attendance", icon: CalendarCheck, page: "attendance" },
       { name: "Timetable", icon: CalendarCheck, page: "timetable" },
     ]
@@ -52,6 +57,7 @@ const ROLES_CONFIG = {
       { name: "Faculty Management", icon: UserPlus, page: "faculty" }, 
       { name: "Student Management", icon: Users, page: "students" },
       { name: "Available Courses", icon: BookOpen, page: "courses" },
+      { name: "Exam Management", icon: BookCopy, page: "exams" },
       { name: "Attendance", icon: CalendarCheck, page: "attendance" },
       { name: "Timetable", icon: CalendarCheck, page: "timetable" },
     ]
@@ -335,7 +341,7 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-function LoginPage({ onLogin, setNotification }) {
+function LoginPage({ onLogin, setNotification, darkMode, toggleDarkMode }) {
   const [role, setRole] = useState('student');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -386,6 +392,22 @@ function LoginPage({ onLogin, setNotification }) {
 
   return (
     <div className="flex min-h-screen items-center justify-center p-4">
+      {/* Theme Toggle Button - Top Right */}
+      <motion.button
+        initial={{ opacity: 0, scale: 0 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ delay: 0.2 }}
+        onClick={toggleDarkMode}
+        className="fixed top-6 right-6 z-50 p-3 rounded-full bg-white dark:bg-gray-800 shadow-lg hover:shadow-xl transition-all duration-200 border-2 border-gray-200 dark:border-gray-700"
+        aria-label="Toggle theme"
+      >
+        {darkMode ? (
+          <Sun className="w-6 h-6 text-yellow-500" />
+        ) : (
+          <Moon className="w-6 h-6 text-indigo-600" />
+        )}
+      </motion.button>
+
       <div className="absolute inset-0 -z-10 h-full w-full bg-white bg-[linear-gradient(to_right,#f0f0f0_1px,transparent_1px),linear-gradient(to_bottom,#f0f0f0_1px,transparent_1px)] bg-[size:6rem_4rem] dark:bg-gray-950 dark:bg-[linear-gradient(to_right,#1f2937_1px,transparent_1px),linear-gradient(to_bottom,#1f2937_1px,transparent_1px)]">
         <div className="absolute bottom-0 left-0 right-0 top-0 bg-[radial-gradient(circle_500px_at_50%_200px,#c084fc,transparent)] dark:bg-[radial-gradient(circle_500px_at_50%_200px,#5b21b6,transparent)] opacity-30"></div>
       </div>
@@ -501,7 +523,7 @@ function LoginPage({ onLogin, setNotification }) {
 // DataContext to hold all fetched data
 const DataContext = React.createContext();
 
-function DataProvider({ children, setNotification }) {
+function DataProvider({ children, setNotification, user }) {
   const [students, setStudents] = useState([]);
   const [faculty, setFaculty] = useState([]);
   const [courses, setCourses] = useState([]);
@@ -548,11 +570,16 @@ function DataProvider({ children, setNotification }) {
   const fetchData = async () => {
     setIsLoading(true);
     try {
+      // Build courses URL with student filter if user is a student
+      const coursesUrl = user && user.role === 'student' && user.id 
+        ? `${API_URL}/courses?student_id=${user.id}`
+        : `${API_URL}/courses`;
+
       // Fetch all data in parallel
       const [studentsRes, facultyRes, coursesRes] = await Promise.all([
         fetch(`${API_URL}/students`),
         fetch(`${API_URL}/faculty`),
-        fetch(`${API_URL}/courses`),
+        fetch(coursesUrl),
       ]);
 
       if (!studentsRes.ok || !facultyRes.ok || !coursesRes.ok) {
@@ -590,7 +617,7 @@ function DataProvider({ children, setNotification }) {
 
   useEffect(() => {
     fetchData();
-  }, []); // Fetch data once on load
+  }, [user]); // Re-fetch when user changes
 
   const contextValue = {
     students, setStudents,
@@ -838,6 +865,12 @@ function PageContent({ page, user, setNotification, setPage }) {
       return <ScoresPage user={user} />;
     case 'attendance':
       return <AttendancePage user={user} />;
+    case 'exams':
+      // Show ExamManagement for admin, ExamsPage for others
+      if (user.role === 'admin') {
+        return <ExamManagement />;
+      }
+      return <ExamsPage user={user} />;
     case 'timetable':
       return <TimetablePage user={user} />;
     case 'students':
@@ -853,7 +886,140 @@ function PageContent({ page, user, setNotification, setPage }) {
 
 function DashboardPage({ user }) {
   const config = ROLES_CONFIG[user.role];
-  const { students, courses } = React.useContext(DataContext);
+  const { students, courses, faculty } = React.useContext(DataContext);
+  const [studentAttendance, setStudentAttendance] = useState(null);
+  const [adminStats, setAdminStats] = useState(null);
+  const [facultyStats, setFacultyStats] = useState(null);
+  const [loading, setLoading] = useState(false);
+  
+  // Fetch real attendance data for students
+  useEffect(() => {
+    if (user.role === 'student' && user.id) {
+      const fetchStudentAttendance = async () => {
+        setLoading(true);
+        try {
+          // Fetch attendance records
+          const attRes = await fetch(`${API_URL}/attendance?student_id=${user.id}`);
+          const attData = await attRes.json().catch(() => []);
+          
+          // Fetch enrollments
+          const enrollRes = await fetch(`${API_URL}/enrollments?student_id=${user.id}`);
+          const enrollData = await enrollRes.json().catch(() => []);
+          
+          const rows = Array.isArray(attData) ? attData : [];
+          const enrollments = Array.isArray(enrollData) ? enrollData : [];
+          
+          let total = 0;
+          let present = 0;
+          
+          for (const row of rows) {
+            total++;
+            if (/present/i.test(String(row.status || ''))) {
+              present++;
+            }
+          }
+          
+          const percent = total === 0 ? 0 : Math.round((present / total) * 100);
+          
+          setStudentAttendance({
+            total,
+            present,
+            absent: total - present,
+            percent,
+            enrollmentCount: enrollments.length
+          });
+        } catch (error) {
+          console.error('Error fetching student attendance:', error);
+        } finally {
+          setLoading(false);
+        }
+      };
+      
+      fetchStudentAttendance();
+    }
+  }, [user]);
+
+  // Fetch admin statistics
+  useEffect(() => {
+    if (user.role === 'admin') {
+      const fetchAdminStats = async () => {
+        setLoading(true);
+        try {
+          // Fetch all necessary data for admin dashboard
+          const [examsRes, attendanceRes] = await Promise.all([
+            fetch(`${API_URL}/exams`),
+            fetch(`${API_URL}/attendance`)
+          ]);
+          
+          const examsData = await examsRes.json().catch(() => []);
+          const attendanceData = await attendanceRes.json().catch(() => []);
+          
+          const exams = Array.isArray(examsData) ? examsData : [];
+          const allAttendance = Array.isArray(attendanceData) ? attendanceData : [];
+          
+          // Calculate attendance statistics
+          let totalRecords = allAttendance.length;
+          let presentCount = allAttendance.filter(record => /present/i.test(String(record.status || ''))).length;
+          let avgAttendance = totalRecords > 0 ? Math.round((presentCount / totalRecords) * 100) : 0;
+          
+          setAdminStats({
+            totalExams: exams.length,
+            avgAttendance,
+            totalAttendanceRecords: totalRecords
+          });
+        } catch (error) {
+          console.error('Error fetching admin stats:', error);
+        } finally {
+          setLoading(false);
+        }
+      };
+      
+      fetchAdminStats();
+    }
+  }, [user]);
+
+  // Fetch faculty statistics
+  useEffect(() => {
+    if (user.role === 'faculty' && user.id) {
+      const fetchFacultyStats = async () => {
+        setLoading(true);
+        try {
+          // Fetch faculty's assigned exams and courses
+          const [examsRes, sectionsRes] = await Promise.all([
+            fetch(`${API_URL}/teacher-exams/${user.id}`),
+            fetch(`${API_URL}/sections?faculty_id=${user.id}`)
+          ]);
+          
+          const examsData = await examsRes.json().catch(() => []);
+          const sectionsData = await sectionsRes.json().catch(() => []);
+          
+          const exams = Array.isArray(examsData) ? examsData : [];
+          const sections = Array.isArray(sectionsData) ? sectionsData : [];
+          
+          // Count unique students across all sections
+          const uniqueStudents = new Set();
+          sections.forEach(section => {
+            if (section.student_count) {
+              // If we have student count from backend
+              uniqueStudents.add(section.section_id);
+            }
+          });
+          
+          setFacultyStats({
+            totalSections: sections.length,
+            totalExams: exams.length,
+            totalStudents: sections.reduce((sum, s) => sum + (s.student_count || 0), 0) || 0
+          });
+        } catch (error) {
+          console.error('Error fetching faculty stats:', error);
+        } finally {
+          setLoading(false);
+        }
+      };
+      
+      fetchFacultyStats();
+    }
+  }, [user]);
   
   const listVariants = {
     hidden: { opacity: 0 },
@@ -866,6 +1032,24 @@ function DashboardPage({ user }) {
   };
   
   const studentCount = students.length;
+  const facultyCount = faculty?.length || 0;
+  
+  // Use real attendance data for students, mock data for others
+  const attendanceValue = user.role === 'student' && studentAttendance 
+    ? `${studentAttendance.percent}%` 
+    : user.role === 'admin' && adminStats
+    ? `${adminStats.avgAttendance}%`
+    : "92.0%";
+    
+  const attendancePieData = user.role === 'student' && studentAttendance
+    ? [
+        { name: 'Present', value: studentAttendance.present },
+        { name: 'Absent', value: studentAttendance.absent }
+      ]
+    : [
+        { name: 'Present', value: 450 },
+        { name: 'Absent', value: 50 }
+      ];
 
   return (
     <div className="space-y-6">
@@ -883,38 +1067,115 @@ function DashboardPage({ user }) {
         initial="hidden"
         animate="visible"
       >
-        <motion.div variants={itemVariants}>
-          <StatCard 
-            title="Active Courses" 
-            value={courses.length}
-            icon={BookUser} 
-            color="indigo" 
-          />
-        </motion.div>
-        <motion.div variants={itemVariants}>
-          <StatCard 
-            title={user.role === 'student' ? 'Overall Score' : 'Avg. Score'}
-            value="88.5%" // Static data
-            icon={GraduationCap} 
-            color="emerald" 
-          />
-        </motion.div>
-        <motion.div variants={itemVariants}>
-          <StatCard 
-            title={user.role === 'student' ? 'Attendance' : 'Avg. Attendance'}
-            value="92.0%" // Static data
-            icon={CalendarCheck} 
-            color="amber" 
-          />
-        </motion.div>
-        <motion.div variants={itemVariants}>
-          <StatCard 
-            title={user.role === 'student' ? 'Pending Alerts' : 'Total Students'}
-            value={user.role === 'student' ? '2' : studentCount}
-            icon={user.role === 'student' ? Bell : Users}
-            color="rose" 
-          />
-        </motion.div>
+        {user.role === 'admin' ? (
+          // Admin-specific dashboard cards
+          <>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Total Students" 
+                value={studentCount}
+                icon={Users} 
+                color="indigo" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Total Faculty"
+                value={facultyCount}
+                icon={User} 
+                color="emerald" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Total Courses"
+                value={courses.length}
+                icon={BookOpen} 
+                color="amber" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Total Exams"
+                value={loading ? '...' : (adminStats?.totalExams || 0)}
+                icon={BookCopy}
+                color="rose" 
+              />
+            </motion.div>
+          </>
+        ) : user.role === 'faculty' ? (
+          // Faculty-specific dashboard cards
+          <>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="My Sections" 
+                value={loading ? '...' : (facultyStats?.totalSections || 0)}
+                icon={BookUser} 
+                color="indigo" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Total Students"
+                value={loading ? '...' : (facultyStats?.totalStudents || 0)}
+                icon={Users} 
+                color="emerald" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="My Courses"
+                value={courses.length}
+                icon={BookOpen} 
+                color="amber" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Assigned Exams"
+                value={loading ? '...' : (facultyStats?.totalExams || 0)}
+                icon={BookCopy}
+                color="rose" 
+              />
+            </motion.div>
+          </>
+        ) : (
+          // Student dashboard cards
+          <>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Active Courses" 
+                value={courses.length}
+                icon={BookUser} 
+                color="indigo" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Overall Score"
+                value="88.5%" // Static data
+                icon={GraduationCap} 
+                color="emerald" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Attendance"
+                value={loading && user.role === 'student' ? '...' : attendanceValue}
+                icon={CalendarCheck} 
+                color="amber" 
+              />
+            </motion.div>
+            <motion.div variants={itemVariants}>
+              <StatCard 
+                title="Active Courses"
+                value={studentAttendance ? studentAttendance.enrollmentCount : courses.length}
+                icon={BookOpen}
+                color="rose" 
+              />
+            </motion.div>
+          </>
+        )}
       </motion.div>
 
       <motion.div 
@@ -1294,12 +1555,97 @@ function TimetablePage({ user }) {
   );
 }
 
+function ExamsPage({ user }) {
+  const isFaculty = user.role === 'faculty';
+  const isStudent = user.role === 'student';
+  const [exams, setExams] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [dateFilter, setDateFilter] = useState('');
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (dateFilter) params.set('date', dateFilter);
+      // The backend enforces scope if we send X-User-Id/X-User-Role headers
+      const headers = {
+        'Accept': 'application/json',
+        'X-User-Id': String(user.id),
+        'X-User-Role': String(user.role),
+      };
+      const res = await fetch(`${API_URL}/exams?${params.toString()}`, { headers });
+      const data = await res.json().catch(() => []);
+      const arr = Array.isArray(data) ? data : (data.value || []);
+      setExams(arr);
+    } catch (e) {
+      console.error('Load exams error:', e);
+      setExams([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { load(); }, [user, dateFilter]);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-3xl font-bold dark:text-white">{isStudent ? 'My Exams' : (isFaculty ? 'Assigned Exams' : 'Exams')}</h1>
+        <div className="flex items-center gap-2">
+          <Input type="date" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)} />
+          <Button onClick={load} isLoading={loading}>Refresh</Button>
+        </div>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Exam Schedule</CardTitle>
+          <CardDescription>{isStudent ? 'Exams allocated to you' : (isFaculty ? 'Exams you are assigned to' : 'All scheduled exams')}</CardDescription>
+        </CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Date</TableHead>
+                <TableHead>Time</TableHead>
+                <TableHead>Course</TableHead>
+                <TableHead>Title</TableHead>
+                <TableHead>Hall</TableHead>
+                <TableHead>Paper</TableHead>
+                {isFaculty && <TableHead>Faculty</TableHead>}
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {exams.map((e) => (
+                <TableRow key={e.exam_id || `${e.course_id}-${e.date}-${e.start_time}`}>
+                  <TableCell>{e.date || '-'}</TableCell>
+                  <TableCell>{(e.start_time ? String(e.start_time).slice(0,5) : '')}{e.end_time ? ` - ${String(e.end_time).slice(0,5)}` : ''}</TableCell>
+                  <TableCell>{e.course_title || e.course_id || '-'}</TableCell>
+                  <TableCell>{e.title || '-'}</TableCell>
+                  <TableCell>{e.hall || '-'}</TableCell>
+                  <TableCell>{e.paper || '-'}</TableCell>
+                  {isFaculty && <TableCell>{e.faculty_name || e.faculty_id || '-'}</TableCell>}
+                </TableRow>
+              ))}
+              {exams.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={isFaculty ? 7 : 6} className="text-center h-24 text-gray-500 dark:text-gray-400">No exams found.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
 /**
  * CoursesPage
  * Updated for Admin role (Add Course)
  */
 function CoursesPage({ user, setNotification }) {
-  const { courses, setCourses } = React.useContext(DataContext);
+  const { courses, setCourses, students } = React.useContext(DataContext);
   const isFaculty = user.role === 'faculty';
   const isAdmin = user.role === 'admin';
   const [isAddCourseModalOpen, setIsAddCourseModalOpen] = useState(false);
@@ -1310,6 +1656,11 @@ function CoursesPage({ user, setNotification }) {
   // Filters and search
   const [searchTerm, setSearchTerm] = useState('');
   const [deptFilter, setDeptFilter] = useState('all');
+
+  // Find the logged-in student's record (if role is student) to show home department
+  const myStudent = (user.role === 'student' && Array.isArray(students))
+    ? students.find(s => String(s.id) === String(user.id) || String(s.student_id) === String(user.id))
+    : null;
 
   const handleDeleteCourse = async (rawId) => {
     const id = Number(rawId);
@@ -1453,26 +1804,36 @@ function CoursesPage({ user, setNotification }) {
           </Button>
         )}
       </div>
-      {/* Filters/Search */}
-      <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
-        <div className="flex items-center gap-3 w-full md:w-auto">
-          <div className="w-full md:w-80">
-            <Input
-              placeholder="Search by course id, title, or department..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-            />
-          </div>
-          <div className="min-w-[180px]">
-            <Select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)}>
-              <SelectItem key="all" value="all">All Departments</SelectItem>
-              {mockDepartments.map((d) => (
-                <SelectItem key={d.id} value={String(d.id)}>{d.name}</SelectItem>
-              ))}
-            </Select>
+      {/* Student home department (show for students) */}
+      {myStudent && (
+        <div className="mb-2">
+          <div className="text-sm text-gray-500 dark:text-gray-400">Department:</div>
+          <div className="text-lg font-semibold text-gray-800 dark:text-gray-100">{myStudent.department || myStudent.program || 'Unknown'}</div>
+        </div>
+      )}
+
+      {/* Filters/Search - Hide for students, show for faculty and admin */}
+      {(isAdmin || isFaculty) && (
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+          <div className="flex items-center gap-3 w-full md:w-auto">
+            <div className="w-full md:w-80">
+              <Input
+                placeholder="Search by course id, title, or department..."
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+              />
+            </div>
+            <div className="min-w-[180px]">
+              <Select value={deptFilter} onChange={(e) => setDeptFilter(e.target.value)}>
+                <SelectItem key="all" value="all">All Departments</SelectItem>
+                {mockDepartments.map((d) => (
+                  <SelectItem key={d.id} value={String(d.id)}>{d.name}</SelectItem>
+                ))}
+              </Select>
+            </div>
           </div>
         </div>
-      </div>
+      )}
       
       <Card>
         <CardContent className="p-0">
@@ -1608,9 +1969,15 @@ function ScoresPage({ user }) {
 
   useEffect(() => {
     // Attempt to fetch scores if endpoint exists; otherwise work locally
+    // If the logged-in user is a student, request only that student's scores
     (async () => {
       try {
-        const res = await fetch(`${API_URL}/scores`);
+        const params = new URLSearchParams();
+        if (user?.role === 'student' && user?.id) {
+          params.append('student_id', String(user.id));
+        }
+        const url = params.toString() ? `${API_URL}/scores?${params.toString()}` : `${API_URL}/scores`;
+        const res = await fetch(url);
         if (!res.ok) throw new Error('no-scores-endpoint');
         const data = await res.json();
         const arr = Array.isArray(data) ? data : (data.value || []);
@@ -1620,7 +1987,7 @@ function ScoresPage({ user }) {
         setScores([]);
       }
     })();
-  }, []);
+  }, [user]);
 
   useEffect(() => {
     // When courses/students change, fill defaults for the form if empty
@@ -1721,6 +2088,17 @@ function ScoresPage({ user }) {
     );
   }, [students, searchTerm]);
 
+  // Pagination for batch grade entry (faculty/admin)
+  const [gradePage, setGradePage] = useState(1);
+  const [gradePageSize, setGradePageSize] = useState(10);
+  const totalGradePages = Math.max(1, Math.ceil(filteredStudents.length / gradePageSize));
+  const paginatedStudents = useMemo(() => {
+    const start = (gradePage - 1) * gradePageSize;
+    return filteredStudents.slice(start, start + gradePageSize);
+  }, [filteredStudents, gradePage, gradePageSize]);
+
+  useEffect(() => { setGradePage(1); }, [searchTerm, selectedCourseId, assessment]);
+
   const setEntry = (sid, val) => {
     const num = val === '' ? '' : Number(val);
     setGradeEntries(prev => ({ ...prev, [sid]: num }));
@@ -1820,7 +2198,7 @@ function ScoresPage({ user }) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {filteredStudents.map(s => (
+                  {paginatedStudents.map(s => (
                     <TableRow key={s.student_id || s.id}>
                       <TableCell>{s.name} <span className="text-xs text-gray-500">({s.student_id || s.id})</span></TableCell>
                       <TableCell>{s.email}</TableCell>
@@ -1836,13 +2214,28 @@ function ScoresPage({ user }) {
                       </TableCell>
                     </TableRow>
                   ))}
-                  {filteredStudents.length === 0 && (
+                  {paginatedStudents.length === 0 && (
                     <TableRow>
                       <TableCell colSpan={3} className="text-center h-24 text-gray-500 dark:text-gray-400">No students found.</TableCell>
                     </TableRow>
                   )}
                 </TableBody>
               </Table>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 mt-2">
+              <div className="text-sm text-gray-600 dark:text-gray-400">Showing {Math.min(paginatedStudents.length, filteredStudents.length)} of {filteredStudents.length}</div>
+              <div className="flex items-center gap-2">
+                <Label className="mr-2">Rows</Label>
+                <Select value={gradePageSize} onChange={(e) => { setGradePageSize(Number(e.target.value)); setGradePage(1); }}>
+                  {[5,10,20,50].map(sz => (
+                    <SelectItem key={sz} value={sz}>{sz}</SelectItem>
+                  ))}
+                </Select>
+                <Button variant="outline" size="sm" onClick={() => setGradePage(p => Math.max(1, p - 1))} disabled={gradePage <= 1}>Prev</Button>
+                <div className="text-sm dark:text-gray-200">Page {gradePage} / {totalGradePages}</div>
+                <Button variant="outline" size="sm" onClick={() => setGradePage(p => Math.min(totalGradePages, p + 1))} disabled={gradePage >= totalGradePages}>Next</Button>
+              </div>
             </div>
           </CardContent>
         </Card>
@@ -1990,7 +2383,9 @@ function ScoresPage({ user }) {
 
 function AttendancePage({ user }) {
   const isFaculty = user.role === 'faculty';
+  const isStudent = user.role === 'student';
   const { students, courses } = React.useContext(DataContext);
+  // Faculty/admin attendance entry state
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedDeptName, setSelectedDeptName] = useState('all');
   const [selectedCourseId, setSelectedCourseId] = useState(courses[0]?.id || '');
@@ -2001,6 +2396,12 @@ function AttendancePage({ user }) {
   const [attPage, setAttPage] = useState(1);
   const [attPageSize, setAttPageSize] = useState(10);
 
+  // Student-specific view state
+  const [studentAttendanceRows, setStudentAttendanceRows] = useState([]); // raw attendance rows for the student
+  const [studentEnrollments, setStudentEnrollments] = useState([]); // enrolled courses for the student
+  const [activeTab, setActiveTab] = useState('subject-wise');
+
+  // Common helpers for faculty/admin (kept as before)
   const filteredStudents = useMemo(() => {
     const q = searchTerm.trim().toLowerCase();
     const byDept = selectedDeptName === 'all' ? students : students.filter(s => s.department === selectedDeptName);
@@ -2042,11 +2443,15 @@ function AttendancePage({ user }) {
     }
   }, [selectedDeptId, courses]);
 
+  // Load attendance for faculty/admin (existing behavior)
   const loadExisting = async () => {
     if (!selectedCourseId || !selectedDate) return;
     setIsLoading(true);
     try {
-      const params = new URLSearchParams({ course_id: String(selectedCourseId), date: selectedDate });
+      // If logged-in user is a student, limit attendance fetch to that student only
+      const paramsObj = { course_id: String(selectedCourseId), date: selectedDate };
+      if (user?.role === 'student' && user?.id) paramsObj.student_id = String(user.id);
+      const params = new URLSearchParams(paramsObj);
       const res = await fetch(`${API_URL}/attendance?${params.toString()}`);
       const data = await res.json().catch(() => []);
       const map = {};
@@ -2096,8 +2501,245 @@ function AttendancePage({ user }) {
     }
   };
 
-  // courseOptions not needed; course list is derived from DataContext and filtered by department
+  // Student view: load attendance rows for this student and compute aggregates
+  useEffect(() => {
+    if (!isStudent) return;
+    let mounted = true;
+    (async () => {
+      try {
+        const params = new URLSearchParams({ student_id: String(user.id) });
+        const res = await fetch(`${API_URL}/attendance?${params.toString()}`);
+        const data = await res.json().catch(() => []);
+        let rows = Array.isArray(data) ? data : (data.value || []);
 
+        // If API returned no rows for the student, fall back to bundled mock data so the UI isn't empty
+        if ((!rows || rows.length === 0) && Array.isArray(mockAttendance) && mockAttendance.length > 0) {
+          // Try to pick mock rows matching the logged-in student by username or id
+          const uname = String(user.username || '').toLowerCase();
+          const byUser = mockAttendance.filter(m => {
+            try {
+              return String(m.studentName || '').toLowerCase().includes(uname) || String(m.studentId || '').toLowerCase() === String(user.id).toLowerCase();
+            } catch { return false; }
+          });
+          const source = byUser.length > 0 ? byUser : mockAttendance.slice(0, 8);
+          rows = source.map(m => ({
+            date: m.date,
+            status: m.status,
+            course_title: m.course,
+            course_id: m.course,
+            // keep original student identifiers to help debugging if needed
+            _mock_studentId: m.studentId,
+            _mock_studentName: m.studentName
+          }));
+        }
+
+        if (!mounted) return;
+        setStudentAttendanceRows(rows);
+
+        // Also fetch enrolled courses so we can show subjects with zero attendance
+        try {
+          const enrRes = await fetch(`${API_URL}/enrollments?student_id=${encodeURIComponent(String(user.id))}`);
+          const enrData = await enrRes.json().catch(() => []);
+          const enrolls = Array.isArray(enrData) ? enrData : (enrData.value || []);
+          if (mounted) setStudentEnrollments(enrolls || []);
+        } catch (e) {
+          // ignore enrollment fetch errors silently
+          if (mounted) setStudentEnrollments([]);
+        }
+      } catch (e) {
+        console.error('Failed to load student attendance:', e);
+        // fallback to a minimal mock set so UI shows something
+        const fallback = mockAttendance.slice(0, 6).map(m => ({ date: m.date, status: m.status, course_title: m.course, course_id: m.course }));
+        setStudentAttendanceRows(fallback);
+        setStudentEnrollments([]);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [isStudent, user.id]);
+
+  // Utilities to compute student stats
+  const studentSummary = useMemo(() => {
+    if (!isStudent) return null;
+    const rows = studentAttendanceRows || [];
+    const total = rows.length;
+    const present = rows.filter(r => /present/i.test(String(r.status || ''))).length;
+    const percent = total === 0 ? 0 : Math.round((present / total) * 100);
+
+    // Group by course
+    const byCourse = {};
+    for (const r of rows) {
+      const key = r.course_title || r.course_id || 'Unknown';
+      if (!byCourse[key]) byCourse[key] = { course: key, total: 0, present: 0 };
+      byCourse[key].total += 1;
+      if (/present/i.test(String(r.status || ''))) byCourse[key].present += 1;
+    }
+
+    // Ensure enrolled courses appear even if they have zero attendance rows
+    try {
+      for (const e of (studentEnrollments || [])) {
+        const key = e.course_title || e.course_id || e.course || String(e.course || e.course_title || e.course_id || 'Unknown');
+        if (!byCourse[key]) {
+          byCourse[key] = { course: key, total: 0, present: 0 };
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    const subjectWise = Object.values(byCourse).map(c => ({
+      course: c.course,
+      present: c.present,
+      total: c.total,
+      percent: c.total === 0 ? 0 : Math.round((c.present / c.total) * 100)
+    }));
+
+    const absenceLog = rows.filter(r => !/present/i.test(String(r.status || ''))).sort((a,b) => String(b.date || '').localeCompare(String(a.date || '')));
+
+    return { total, present, percent, subjectWise, absenceLog };
+  }, [studentAttendanceRows, studentEnrollments, isStudent]);
+
+  // Render student-focused UI
+  if (isStudent) {
+    const summary = studentSummary || { total:0, present:0, percent:0, subjectWise:[], absenceLog:[] };
+    const pieData = [ { name: 'Present', value: summary.present }, { name: 'Absent', value: Math.max(0, summary.total - summary.present) } ];
+    return (
+      <div className="space-y-6">
+        <div className="flex items-center justify-between">
+          <h1 className="text-3xl font-bold dark:text-white">Attendance % / {new Date().getFullYear()}-{new Date().getFullYear()+1}</h1>
+          <div>
+            <Select value="term"> 
+              <SelectItem value="term">2025-2026, , ODD UG-II, B.TE...</SelectItem>
+            </Select>
+          </div>
+        </div>
+
+        {/* Tabs */}
+        <div className="flex items-center gap-4 border-b border-gray-200 dark:border-gray-700 pb-2">
+          <button className={cn('px-3 py-2 font-medium transition-colors', activeTab==='subject-wise' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-indigo-600 dark:border-indigo-400' : 'text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200')} onClick={() => setActiveTab('subject-wise')}>SUBJECT-WISE</button>
+          <button className={cn('px-3 py-2 font-medium transition-colors', activeTab==='absence-log' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-indigo-600 dark:border-indigo-400' : 'text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200')} onClick={() => setActiveTab('absence-log')}>ABSENCE LOG</button>
+          <button className={cn('px-3 py-2 font-medium transition-colors', activeTab==='present' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-indigo-600 dark:border-indigo-400' : 'text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200')} onClick={() => setActiveTab('present')}>PRESENT</button>
+          <button className={cn('px-3 py-2 font-medium transition-colors', activeTab==='overall' ? 'text-indigo-600 dark:text-indigo-400 border-b-2 border-indigo-600 dark:border-indigo-400' : 'text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200')} onClick={() => setActiveTab('overall')}>OVER ALL</button>
+        </div>
+
+        {activeTab === 'subject-wise' && (
+          <Card>
+            <CardContent>
+              <div style={{ width: '100%', height: 360 }}>
+                <ResponsiveContainer width="100%" height={360}>
+                  <BarChart data={summary.subjectWise} margin={{ top: 20, right: 20, left: 20, bottom: 80 }} barSize={60}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} className="stroke-gray-300 dark:stroke-gray-700" strokeOpacity={0.3} />
+                    <XAxis 
+                      dataKey="course" 
+                      tick={{ fontSize: 11, fill: 'currentColor' }} 
+                      className="text-gray-700 dark:text-gray-300"
+                      angle={-45}
+                      textAnchor="end"
+                      height={80}
+                      stroke="currentColor"
+                    />
+                    <YAxis 
+                      domain={[0,100]} 
+                      tickFormatter={(v) => `${v}%`}
+                      tick={{ fontSize: 12, fill: 'currentColor' }}
+                      className="text-gray-700 dark:text-gray-300"
+                      stroke="currentColor"
+                    />
+                    <Tooltip 
+                      formatter={(v) => `${v}%`}
+                      contentStyle={{
+                        backgroundColor: 'var(--tooltip-bg)',
+                        border: '1px solid var(--tooltip-border)',
+                        borderRadius: '0.5rem',
+                        color: 'var(--tooltip-text)'
+                      }}
+                      labelStyle={{ color: 'inherit', fontWeight: '600' }}
+                      wrapperClassName="[--tooltip-bg:white] [--tooltip-border:#e5e7eb] [--tooltip-text:#1f2937] dark:[--tooltip-bg:#1f2937] dark:[--tooltip-border:#374151] dark:[--tooltip-text:#f3f4f6]"
+                    />
+                    <Bar dataKey="percent" fill="#6366f1" radius={[4,4,0,0]} maxBarSize={50} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {activeTab === 'absence-log' && (
+          <Card>
+            <CardContent>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>DATE</TableHead>
+                    <TableHead>TYPE</TableHead>
+                    <TableHead>COURSE</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {summary.absenceLog.map((r, idx) => (
+                    <TableRow key={idx}>
+                      <TableCell>{String(r.date || r.attendance_date || '-')}</TableCell>
+                      <TableCell>{r.status || 'Absent'}</TableCell>
+                      <TableCell>{r.course_title || r.course_id || '-'}</TableCell>
+                    </TableRow>
+                  ))}
+                  {summary.absenceLog.length === 0 && (
+                    <TableRow><TableCell colSpan={3} className="text-center text-gray-500">No absence records.</TableCell></TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        )}
+
+        {activeTab === 'present' && (
+          <Card>
+            <CardContent className="flex items-center gap-6">
+              <div style={{ width: 150, height: 150 }}>
+                <ResponsiveContainer width="100%" height={150}>
+                  <PieChart>
+                    <Pie data={pieData} dataKey="value" innerRadius={50} outerRadius={70} paddingAngle={4}>
+                      <Cell fill="#0ea5e9" />
+                      <Cell fill="#f97316" />
+                    </Pie>
+                    <Tooltip />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+              <div>
+                <div className="text-4xl font-bold">{summary.percent}%</div>
+                <div className="text-sm text-gray-600">Current semester attendance</div>
+                <div className="mt-2 text-sm">No. of periods present : {summary.present}/{summary.total}</div>
+                <div className="mt-1 text-sm">Current month : {new Date().toLocaleString('default', { month: 'long', year: 'numeric' })}</div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {activeTab === 'overall' && (
+          <Card>
+            <CardContent>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="p-4 bg-white dark:bg-gray-800 rounded-lg shadow border border-gray-200 dark:border-gray-700">
+                  <div className="text-3xl font-bold text-gray-900 dark:text-white">{summary.percent}%</div>
+                  <div className="text-sm text-gray-600 dark:text-gray-400">Overall attendance</div>
+                </div>
+                <div className="p-4 bg-white dark:bg-gray-800 rounded-lg shadow border border-gray-200 dark:border-gray-700">
+                  <div className="text-lg text-gray-700 dark:text-gray-300">No. of periods present</div>
+                  <div className="text-xl font-semibold text-gray-900 dark:text-white">{summary.present}/{summary.total}</div>
+                </div>
+                <div className="p-4 bg-white dark:bg-gray-800 rounded-lg shadow border border-gray-200 dark:border-gray-700">
+                  <div className="text-lg text-gray-700 dark:text-gray-300">Current month</div>
+                  <div className="text-xl font-semibold text-gray-900 dark:text-white">{new Date().toLocaleString('default', { month: 'long', year: 'numeric' })}</div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+    );
+  }
+
+  // Default render (faculty/admin) - unchanged from earlier flow
   return (
     <div className="space-y-6">
       <h1 className="text-3xl font-bold dark:text-white">Attendance</h1>
@@ -3019,6 +3661,24 @@ function NotificationPanel({ isOpen, onClose, notifications = [], onMarkAllRead,
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [notification, setNotification] = useState(null);
+  const [darkMode, setDarkMode] = useState(() => {
+    // Check localStorage or system preference
+    const saved = localStorage.getItem('darkMode');
+    if (saved !== null) {
+      return JSON.parse(saved);
+    }
+    return window.matchMedia('(prefers-color-scheme: dark)').matches;
+  });
+
+  // Apply dark mode class to document
+  useEffect(() => {
+    if (darkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    localStorage.setItem('darkMode', JSON.stringify(darkMode));
+  }, [darkMode]);
 
   const handleLogin = (user) => {
     setCurrentUser(user);
@@ -3032,6 +3692,10 @@ export default function App() {
     setNotification(null);
   };
 
+  const toggleDarkMode = () => {
+    setDarkMode(!darkMode);
+  };
+
   return (
     <Fragment>
       <AnimatePresence mode="wait">
@@ -3043,7 +3707,7 @@ export default function App() {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.5 }}
           >
-            <DataProvider setNotification={setNotification}>
+            <DataProvider setNotification={setNotification} user={currentUser}>
               <MainDashboard 
                 user={currentUser} 
                 onLogout={handleLogout} 
@@ -3061,7 +3725,9 @@ export default function App() {
           >
             <LoginPage 
               onLogin={handleLogin} 
-              setNotification={setNotification} 
+              setNotification={setNotification}
+              darkMode={darkMode}
+              toggleDarkMode={toggleDarkMode}
             />
           </motion.div>
         )}
